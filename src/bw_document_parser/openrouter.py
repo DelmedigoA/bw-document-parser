@@ -57,11 +57,19 @@ def _retry_after(headers) -> float | None:
 
 
 def post(endpoint: str, payload: dict) -> dict:
+    return _post(f"{_URL}/{endpoint}", payload)
+
+
+def decide(payload: dict) -> dict:
+    return _post("https://openrouter.ai/api/alpha/decisions", payload)
+
+
+def _post(url: str, payload: dict) -> dict:
     key = os.getenv("OPENROUTER_API_KEY")
     if not key:
         raise OpenRouterError("set OPENROUTER_API_KEY for hosted processing", status=401)
     request = Request(
-        f"{_URL}/{endpoint}",
+        url,
         data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
         headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
     )

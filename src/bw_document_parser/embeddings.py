@@ -7,7 +7,9 @@ import math
 import sys
 import threading
 import time
+from collections.abc import Callable, Iterable
 from concurrent.futures import CancelledError, ThreadPoolExecutor, as_completed
+from copy import deepcopy
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
@@ -25,6 +27,8 @@ from .bundle import (
 )
 from .chunks import MAX_TOKENS, _token_count
 from .concurrency import resolve_workers
+from .document import EmbeddedDoc, EnrichedDoc, upgrade_resolved
+from .resolving import block_document, resolved_pieces
 from .search_entries import SearchEntry, search_entries
 
 NEMOTRON = "nvidia/nemotron-3.5-embed-8b"
@@ -32,9 +36,11 @@ TITAN = "amazon/titan-embed-image-v1"
 # Leave headroom under OpenRouter's 128-token limit for tokenizer differences.
 TITAN_CHUNK_TOKENS = 96
 TEXT_MODEL = "openai/text-embedding-3-small"
-MODES = {"multimodal": (f"{NEMOTRON}:free", 4096), "text": (TEXT_MODEL, 1536)}
+DEFAULT_MODE = "text"
+MODES = {"text": (TEXT_MODEL, 1536), "multimodal": (f"{NEMOTRON}:free", 4096)}
 # Rewriting the whole index is expensive once vectors accumulate.
 SAVE_INTERVAL = 10.0
+EMBED_STRATEGY = "piece-targets-v1"
 
 # OpenAI accepts an array of strings. Titan embeds one item per request.
 # Nemotron uses the same OpenRouter array shape; an unsupported batch falls
@@ -303,14 +309,42 @@ def _batches(works: list[_Work], model: str, batch_size: int | None) -> list[lis
     return batches
 
 
-def embed_bundle(
-    bundle: Path,
-    mode: str,
-    model_override: str | None = None,
-    *,
-    workers: int | None = None,
-    batch_size: int | None = None,
-) -> bool:
+def _input_document_fingerprint(blocks: dict) -> str:
+    """Ignore routing audit metadata when checking whether embedding inputs changed."""
+    return fingerprint({
+        **blocks,
+        "pieces": [
+            {key: value for key, value in block.items() if key != "enrichment_decision"}
+            for block in blocks["pieces"]
+        ],
+    })
+
+
+def _resolved_index(document: EmbeddedDoc, mode: str) -> dict:
+    metadata = document.get("embedding_modes", {}).get(mode)
+    if metadata is None:
+        return {}
+    return {
+        **metadata,
+        "entries": [
+            entry for piece in resolved_pieces(document)
+            for entry in piece["embeddings"] if entry["mode"] == mode
+        ],
+    }
+
+
+def embed_document(
+    enriched: EnrichedDoc, bundle: Path, mode: str = DEFAULT_MODE, model_override: str | None = None, *,
+    targets: Iterable[SearchEntry] | None = None,
+    workers: int | None = None, batch_size: int | None = None,
+    save: Callable[[dict], None] | None = None,
+) -> tuple[EmbeddedDoc, bool]:
+    """Embed the standard inputs or an explicit set, preserving piece identity."""
+    document = upgrade_resolved(deepcopy(enriched))
+    blocks = block_document(document)
+    owners = {
+        block_id: piece for piece in resolved_pieces(document) for block_id in piece["source_ids"]
+    } if document["schema_version"] == 4 else {}
     workers = resolve_workers(workers, "BW_EMBED_WORKERS")
     default_model, dimensions = MODES[mode]
     model = model_override or default_model
@@ -318,187 +352,233 @@ def embed_bundle(
         raise ValueError(f"{model} is unsupported in {mode} mode")
     if model == TITAN:
         dimensions = 1024
+
+    old = _resolved_index(document, mode) if document["schema_version"] == 4 else {}
+    path = _path(bundle, mode)
+    if not old and path.is_file():
+        # Upgraded bundles can still reuse exact inputs from a legacy index.
+        old = read_json(path)
+
+    cached = {}
+    if old.get("model") == model and old.get("dimensions") == dimensions:
+        cached = {
+            item["input_fingerprint"]: item
+            for item in old.get("entries", [])
+            if isinstance(item, dict)
+            and "input_fingerprint" in item
+            and _valid_vector(item.get("vector"), dimensions)
+        }
+    cached_costs = {}
+    for item in old.get("entries", []):
+        key = item.get("input_fingerprint")
+        cost = item.get("cost")
+        if key in cached and type(cost) in (int, float) and math.isfinite(cost):
+            cached_costs[key] = cached_costs.get(key, 0.0) + cost
+    entries = {}
+    pending: dict[str, _Work] = {}
+    sources = list(targets) if targets is not None else list(search_entries(
+        blocks, multimodal=mode == "multimodal",
+        max_tokens=TITAN_CHUNK_TOKENS if model == TITAN else MAX_TOKENS,
+    ))
+    if document["schema_version"] == 4 and any(
+        not source.piece_ids or any(block_id not in owners for block_id in source.piece_ids)
+        for source in sources
+    ):
+        raise ValueError("embedding target must reference a resolved block")
+    for source in sources:
+        try:
+            raw = read_image(bundle, source.image_path) if source.image_path else None
+            image_hash = hashlib.sha256(raw).hexdigest() if raw is not None else None
+            identity = fingerprint(model, dimensions, "document-v1", source.text, image_hash)
+            previous = cached.get(identity)
+            if previous is not None:
+                entry = {
+                    **asdict(source),
+                    "input_fingerprint": identity,
+                    "vector": previous["vector"],
+                }
+                entries[source.id] = entry
+                continue
+            work = pending.get(identity)
+            if work is None:
+                pending[identity] = _Work(
+                    identity,
+                    source.text,
+                    api_image(raw, 1540) if raw is not None else None,
+                    [source],
+                    max(1, _token_count(source.text)),
+                )
+            else:
+                work.sources.append(source)
+        except (OSError, ValueError) as exc:
+            print(f"{source.id}: {exc}", file=sys.stderr)
+
+    cached_groups = {}
+    for entry in entries.values():
+        cached_groups.setdefault(entry["input_fingerprint"], []).append(entry)
+    for key, group in cached_groups.items():
+        if key in cached_costs:
+            for entry in group:
+                entry["cost"] = cached_costs[key] / len(group)
+                entry["cost_allocation"] = "estimated" if len(group) > 1 else cached[key].get("cost_allocation", "estimated")
+
+    reused = len(entries)
+    writes = 0
+    document_fingerprint = _input_document_fingerprint(blocks)
+
+    def snapshot() -> dict:
+        return {
+            "schema_version": 1,
+            "document_id": document["document_id"],
+            "document_fingerprint": document_fingerprint,
+            "model": model,
+            "dimensions": dimensions,
+            "mode": mode,
+            "complete": len(entries) == len(sources),
+            "expected_entries": len(sources),
+            "entries": [entries[source.id] for source in sources if source.id in entries],
+            "billing": _billing(entries),
+        }
+
+    def save_snapshot():
+        nonlocal writes
+        index = snapshot()
+        if document["schema_version"] == 4:
+            for piece in resolved_pieces(document):
+                piece["embeddings"] = [item for item in piece["embeddings"] if item["mode"] != mode]
+            for entry in index["entries"]:
+                owners[entry["piece_ids"][0]]["embeddings"].append({
+                    **entry, "mode": mode, "model": model, "dimensions": dimensions,
+                })
+            document.setdefault("embedding_modes", {})[mode] = {
+                key: value for key, value in index.items() if key != "entries"
+            }
+            document["strategies"]["embed"] = EMBED_STRATEGY
+        if save is not None:
+            save(document if document["schema_version"] == 4 else index)
+            writes += 1
+
+    works = list(pending.values())
+    work_batches = _batches(works, model, batch_size)
+    requests = 0
+    failed = 0
+    stop = threading.Event()
+    if work_batches:
+        # A full index can be tens of megabytes, so rewriting it after
+        # every batch would dominate a large run. Save periodically for
+        # crash resilience and always save before returning or raising.
+        last_save = time.monotonic()
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = {
+                pool.submit(_execute_batch, batch, model, dimensions, stop): batch
+                for batch in work_batches
+            }
+            remaining = set(futures)
+            interrupted = None
+            while remaining:
+                try:
+                    future = next(as_completed(remaining))
+                    remaining.remove(future)
+                    try:
+                        outcome = future.result()
+                    except CancelledError:
+                        continue
+                    requests += outcome.requests
+                    progress = False
+                    for work, exc in outcome.errors:
+                        print(f"{work.sources[0].id}: {exc}", file=sys.stderr)
+                        failed += len(work.sources)
+                    for key, vector in outcome.vectors.items():
+                        work = pending[key]
+                        params = outcome.costs.get(work.key)
+                        for index, source in enumerate(work.sources):
+                            entry = {
+                                **asdict(source),
+                                "input_fingerprint": work.key,
+                                "vector": vector,
+                            }
+                            if params is not None:
+                                cost, allocation = params
+                                if cost is not None:
+                                    # Duplicate inputs share one paid request.
+                                    entry["cost"] = cost / len(work.sources)
+                                    entry["cost_allocation"] = (
+                                        "exact"
+                                        if allocation == "exact"
+                                        and len(work.sources) == 1
+                                        else "estimated"
+                                    )
+                            entries[source.id] = entry
+                            if index:
+                                reused += 1
+                        progress = True
+                    if progress and time.monotonic() - last_save >= SAVE_INTERVAL:
+                        save_snapshot()
+                        last_save = time.monotonic()
+                    if outcome.blocked:
+                        stop.set()
+                        for pending_future in futures:
+                            pending_future.cancel()
+                except (Exception, KeyboardInterrupt) as exc:  # noqa: BLE001 -- drain paid work before reraising
+                    if interrupted is None:
+                        interrupted = exc
+                    stop.set()
+                    for pending_future in remaining:
+                        pending_future.cancel()
+            if interrupted is not None:
+                save_snapshot()
+                raise interrupted
+
+    complete = len(entries) == len(sources)
+    if not complete and not entries and old.get("entries"):
+        print("Retained existing embeddings", file=sys.stderr)
+        return document, False
+    save_snapshot()
+    print(
+        f"{mode} embeddings ({len(entries)}/{len(sources)} entries, {reused} reused, "
+        f"{requests} requests, {failed} failed, {writes} saves, "
+        f"workers: {workers})"
+    )
+    return document, complete
+
+
+
+def embed_bundle(
+    bundle: Path, mode: str = DEFAULT_MODE, model_override: str | None = None, *,
+    workers: int | None = None, batch_size: int | None = None,
+) -> bool:
     with document_lock(bundle):
         document = read_document(bundle)
-        path = _path(bundle, mode)
-        old = read_json(path) if path.is_file() else {}
-        cached = {}
-        if old.get("model") == model and old.get("dimensions") == dimensions:
-            cached = {
-                item["input_fingerprint"]: item
-                for item in old.get("entries", [])
-                if isinstance(item, dict)
-                and "input_fingerprint" in item
-                and _valid_vector(item.get("vector"), dimensions)
-            }
-        cached_costs = {}
-        for item in old.get("entries", []):
-            key = item.get("input_fingerprint")
-            cost = item.get("cost")
-            if key in cached and type(cost) in (int, float) and math.isfinite(cost):
-                cached_costs[key] = cached_costs.get(key, 0.0) + cost
-        entries = {}
-        pending: dict[str, _Work] = {}
-        sources = list(search_entries(
-            document, multimodal=mode == "multimodal",
-            max_tokens=TITAN_CHUNK_TOKENS if model == TITAN else MAX_TOKENS,
-        ))
-        for source in sources:
-            try:
-                raw = read_image(bundle, source.image_path) if source.image_path else None
-                image_hash = hashlib.sha256(raw).hexdigest() if raw is not None else None
-                identity = fingerprint(model, dimensions, "document-v1", source.text, image_hash)
-                previous = cached.get(identity)
-                if previous is not None:
-                    entry = {
-                        **asdict(source),
-                        "input_fingerprint": identity,
-                        "vector": previous["vector"],
-                    }
-                    entries[source.id] = entry
-                    continue
-                work = pending.get(identity)
-                if work is None:
-                    pending[identity] = _Work(
-                        identity,
-                        source.text,
-                        api_image(raw, 1540) if raw is not None else None,
-                        [source],
-                        max(1, _token_count(source.text)),
-                    )
-                else:
-                    work.sources.append(source)
-            except (OSError, ValueError) as exc:
-                print(f"{source.id}: {exc}", file=sys.stderr)
-
-        cached_groups = {}
-        for entry in entries.values():
-            cached_groups.setdefault(entry["input_fingerprint"], []).append(entry)
-        for key, group in cached_groups.items():
-            if key in cached_costs:
-                for entry in group:
-                    entry["cost"] = cached_costs[key] / len(group)
-                    entry["cost_allocation"] = "estimated" if len(group) > 1 else cached[key].get("cost_allocation", "estimated")
-
-        reused = len(entries)
+        path = bundle / "document.json" if document["schema_version"] == 4 else _path(bundle, mode)
         writer = JsonWriter(path)
-        document_fingerprint = fingerprint(document)
-
-        def snapshot() -> dict:
-            return {
-                "schema_version": 1,
-                "document_id": document["document_id"],
-                "document_fingerprint": document_fingerprint,
-                "model": model,
-                "dimensions": dimensions,
-                "mode": mode,
-                "complete": len(entries) == len(sources),
-                "expected_entries": len(sources),
-                "entries": [entries[source.id] for source in sources if source.id in entries],
-                "billing": _billing(entries),
-            }
-
-        works = list(pending.values())
-        work_batches = _batches(works, model, batch_size)
-        requests = 0
-        failed = 0
-        stop = threading.Event()
-        if work_batches:
-            # A full index can be tens of megabytes, so rewriting it after
-            # every batch would dominate a large run. Save periodically for
-            # crash resilience and always save before returning or raising.
-            last_save = time.monotonic()
-            with ThreadPoolExecutor(max_workers=workers) as pool:
-                futures = {
-                    pool.submit(_execute_batch, batch, model, dimensions, stop): batch
-                    for batch in work_batches
-                }
-                remaining = set(futures)
-                interrupted = None
-                while remaining:
-                    try:
-                        future = next(as_completed(remaining))
-                        remaining.remove(future)
-                        try:
-                            outcome = future.result()
-                        except CancelledError:
-                            continue
-                        requests += outcome.requests
-                        progress = False
-                        for work, exc in outcome.errors:
-                            print(f"{work.sources[0].id}: {exc}", file=sys.stderr)
-                            failed += len(work.sources)
-                        for work in works:
-                            vector = outcome.vectors.get(work.key)
-                            if vector is None:
-                                continue
-                            params = outcome.costs.get(work.key)
-                            for index, source in enumerate(work.sources):
-                                entry = {
-                                    **asdict(source),
-                                    "input_fingerprint": work.key,
-                                    "vector": vector,
-                                }
-                                if params is not None:
-                                    cost, allocation = params
-                                    if cost is not None:
-                                        # Duplicate inputs share one paid request.
-                                        entry["cost"] = cost / len(work.sources)
-                                        entry["cost_allocation"] = (
-                                            "exact"
-                                            if allocation == "exact"
-                                            and len(work.sources) == 1
-                                            else "estimated"
-                                        )
-                                entries[source.id] = entry
-                                if index:
-                                    reused += 1
-                            progress = True
-                        if progress and time.monotonic() - last_save >= SAVE_INTERVAL:
-                            writer.write(snapshot())
-                            last_save = time.monotonic()
-                        if outcome.blocked:
-                            stop.set()
-                            for pending_future in futures:
-                                pending_future.cancel()
-                    except (Exception, KeyboardInterrupt) as exc:  # noqa: BLE001 -- drain paid work before reraising
-                        if interrupted is None:
-                            interrupted = exc
-                        stop.set()
-                        for pending_future in remaining:
-                            pending_future.cancel()
-                if interrupted is not None:
-                    writer.write(snapshot())
-                    raise interrupted
-
-        complete = len(entries) == len(sources)
-        if not complete and not entries and old.get("entries"):
-            print(f"Retained the existing {path.name}", file=sys.stderr)
-            return False
-        writer.write(snapshot())
-        print(
-            f"{path} ({len(entries)}/{len(sources)} entries, {reused} reused, "
-            f"{requests} requests, {failed} failed, {writer.writes} saves, "
-            f"workers: {workers})"
+        _, complete = embed_document(
+            document, bundle, mode, model_override,
+            workers=workers, batch_size=batch_size, save=writer.write,
         )
         return complete
 
-
 def search_bundle(
-    bundle: Path, query: str, mode: str, limit: int = 5, *, figures_only: bool = False,
+    bundle: Path, query: str, mode: str = DEFAULT_MODE, limit: int = 5, *, figures_only: bool = False,
 ) -> list[dict]:
     query = query.strip()
     if not query or limit < 1:
         raise ValueError("provide a query and a positive result limit")
     document = read_document(bundle)
-    index = read_json(_path(bundle, mode))
-    if index.get("document_fingerprint") != fingerprint(document):
+    blocks = block_document(document)
+    resolved = document["schema_version"] == 4
+    index = _resolved_index(document, mode) if resolved else read_json(_path(bundle, mode))
+    if not index:
+        raise FileNotFoundError(f"No {mode} embeddings")
+    if index.get("document_fingerprint") != _input_document_fingerprint(blocks):
         raise ValueError("document.json changed. Rebuild embeddings for this mode first")
     if not index["entries"]:
         return []
     if not index["complete"]:
         print("Searching a partial index. Rerun embedding to finish it.", file=sys.stderr)
-    by_id = {piece["id"]: piece for piece in document["pieces"]}
+    by_id = {piece["id"]: piece for piece in blocks["pieces"]}
+    parents = {
+        block_id: piece for piece in resolved_pieces(document) for block_id in piece["source_ids"]
+    } if resolved else {}
     candidates = index["entries"]
     if figures_only:
         candidates = [
@@ -519,6 +599,8 @@ def search_bundle(
         other_norm = math.hypot(*values)
         score = math.fsum((left / norm) * (right / other_norm) for left, right in zip(vector, values))
         hit = {key: value for key, value in item.items() if key != "vector"}
+        if parent := parents.get(item["piece_ids"][0]):
+            hit["parent_piece"] = {key: value for key, value in parent.items() if key != "embeddings"}
         scored.append({
             **hit, "score": score, "document_id": document["document_id"],
             "pieces": [by_id[piece_id] for piece_id in item["piece_ids"]],
@@ -535,7 +617,7 @@ def search_bundle(
 def main() -> int:
     parser = argparse.ArgumentParser(description="Generate embeddings for a parsed PDF bundle.")
     parser.add_argument("bundle", type=Path)
-    parser.add_argument("--mode", choices=MODES, default="multimodal")
+    parser.add_argument("--mode", choices=MODES, default=DEFAULT_MODE, help="embedding mode (default: text)")
     parser.add_argument("--model", choices=(NEMOTRON, f"{NEMOTRON}:free", TITAN, TEXT_MODEL),
                         help="Override the model for the selected mode")
     parser.add_argument(
@@ -565,7 +647,7 @@ def search_main() -> int:
     parser = argparse.ArgumentParser(description="Search a parsed PDF bundle by vector similarity.")
     parser.add_argument("bundle", type=Path)
     parser.add_argument("query")
-    parser.add_argument("--mode", choices=MODES, default="multimodal")
+    parser.add_argument("--mode", choices=MODES, default=DEFAULT_MODE, help="embedding mode (default: text)")
     parser.add_argument("--limit", type=int, default=5)
     args = parser.parse_args()
     try:

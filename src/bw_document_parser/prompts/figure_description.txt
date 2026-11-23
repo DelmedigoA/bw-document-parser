@@ -1,12 +1,4 @@
-First decide whether the figure is decorative. A standalone logo, watermark,
-decorative icon, or tiny graphic with no document information is decorative.
-Keep charts, maps, infographics, and images that carry evidence even when they
-are small. A logo inside an informative figure does not make that figure
-decorative. When unsure, keep the figure. If all supplied images are decorative,
-return decorative=true and null for both description and visible_text.
-Otherwise return decorative=false and describe the informative content.
-
-Describe the figure in one to three concrete sentences for document retrieval.
+Describe the figure in two to eight concrete sentences for document retrieval.
 Describe what is visible, using the supplied caption and heading only as context.
 Use the language of the caption when clear, otherwise English. Transcribe only
 clearly legible text visible in the images, preserving its language. Return null for

@@ -107,14 +107,26 @@ def search_entries(document: dict, *, multimodal: bool, max_tokens: int = MAX_TO
         for piece in document["pieces"] if piece["content"]["kind"] == "figure"
         for child in piece["children"]
     }
+    table_by_note = {
+        note_id: piece["id"]
+        for piece in document["pieces"]
+        for note_id in piece.get("inferred_note_ids", [])
+    }
     for piece, headings, by_id in pieces_with_context(document, include_decorative=False):
         piece_id = piece["id"]
         kind = piece["content"]["kind"]
         parent = figure_by_child.get(piece_id)
         piece_ids = [piece_id] if parent is None else [piece_id, parent["id"]]
+        piece_ids.extend(piece.get("inferred_note_ids", []))
+        if piece_id in table_by_note:
+            piece_ids.append(table_by_note[piece_id])
         locations = piece["locations"] or (parent["locations"] if parent else [])
         images = asset_paths(piece) if multimodal else []
         captions = linked_text(piece, by_id, "caption_ids")
+        if kind == "table" and not captions and (title_id := piece.get("inferred_title_id")):
+            title = text_of(by_id[title_id])
+            if title and title not in headings:
+                captions.append(title)
         if parent and not captions:
             captions = linked_text(parent, by_id, "caption_ids")
         context = "\n".join(filter(None, (" / ".join(headings), *captions)))
@@ -128,6 +140,8 @@ def search_entries(document: dict, *, multimodal: bool, max_tokens: int = MAX_TO
             for index, image in enumerate(images):
                 yield SearchEntry(f"{piece_id}:image-{index}", piece_ids, locations, table_overview, image)
         elif kind == "figure":
+            if (piece.get("enrichment_decision") or {}).get("enrich") is False:
+                continue
             enrichment = piece.get("enrichment") or {}
             recovered = [text_of(by_id[ref]) for ref in piece["children"] if ref in by_id]
             values = [

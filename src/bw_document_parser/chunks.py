@@ -5,7 +5,7 @@ import hashlib
 import mimetypes
 import re
 from collections.abc import Callable, Iterator
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import cache
 from pathlib import Path
 from urllib.parse import unquote_to_bytes
@@ -38,6 +38,7 @@ class Page:
 class _Block:
     text: str
     kind: str = "text"
+    source_id: str | None = None
 
 
 class ImageFiles:
@@ -190,22 +191,22 @@ def _split_block(block: _Block, limit: int) -> Iterator[_Block]:
             current += segment
             continue
         if current.strip():
-            yield _Block(current.strip(), block.kind)
+            yield replace(block, text=current.strip())
         current = segment.lstrip()
         if _token_count(current) > limit:
             for fragment in _split_tokens(current, limit):
                 if fragment.strip():
-                    yield _Block(fragment.strip(), block.kind)
+                    yield replace(block, text=fragment.strip())
             current = ""
     if current.strip():
-        yield _Block(current.strip(), block.kind)
+        yield replace(block, text=current.strip())
 
 
 def _join(blocks: list[_Block]) -> str:
     return "\n\n".join(block.text for block in blocks)
 
 
-def _pack_section(section: list[_Block]) -> list[list[_Block]]:
+def _pack_section(section: list[_Block], *, repeat_heading: bool = True) -> list[list[_Block]]:
     prefix = section[:1] if section[0].kind == "heading" else []
     limit = (
         max(10, MAX_TOKENS - _token_count(_join(prefix)) - 5) if prefix else MAX_TOKENS
@@ -213,11 +214,12 @@ def _pack_section(section: list[_Block]) -> list[list[_Block]]:
     groups: list[list[_Block]] = []
     current = prefix.copy()
     size = _token_count(_join(current))
+    prefix_count = len(prefix)
 
     for block in section[len(prefix) :]:
         for atom in _split_block(block, limit):
             combined_size = _token_count(_join([*current, atom]))
-            if len(current) > len(prefix) and (
+            if len(current) > prefix_count and (
                 combined_size > MAX_TOKENS
                 or (
                     size >= MIN_TOKENS
@@ -225,7 +227,8 @@ def _pack_section(section: list[_Block]) -> list[list[_Block]]:
                 )
             ):
                 groups.append(current)
-                current = prefix.copy()
+                current = prefix.copy() if repeat_heading else []
+                prefix_count = len(current)
                 combined_size = _token_count(_join([*current, atom]))
             current.append(atom)
             size = combined_size
@@ -233,7 +236,7 @@ def _pack_section(section: list[_Block]) -> list[list[_Block]]:
     # Merge the last short piece at block level. Its repeated heading and image
     # indexes have yet to be rendered, so neither needs a text rewrite.
     if groups and size < MIN_TOKENS:
-        merged = groups[-1] + current[len(prefix) :]
+        merged = groups[-1] + current[prefix_count:]
         if _token_count(_join(merged)) <= MAX_TOKENS:
             groups[-1] = merged
             return groups

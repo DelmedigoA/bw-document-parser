@@ -10,7 +10,10 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlsplit
 
+from .bundle import read_document
+from .document import pack_piece, unpack_piece
 from .embeddings import MODES, search_bundle
+from .resolving import resolved_pieces
 
 _STATIC = Path(__file__).with_name("static")
 _ASSETS = {
@@ -23,22 +26,60 @@ _ASSETS = {
 }
 
 
+def _resolved_page(document: dict, number: int) -> dict | None:
+    page = next((page for page in document["pages"] if page["number"] == number), None)
+    if page is None:
+        return None
+    sections = []
+    source_blocks: dict = {}
+    for piece in resolved_pieces(document):
+        blocks = [
+            block for block in unpack_piece(piece, document["source_blocks"])
+            if block["page"] == number or any(loc["page"] == number for loc in block["locations"])
+        ]
+        if blocks:
+            sections.append(pack_piece({
+                "id": piece["id"], "title": piece["title"], "page": piece["page"],
+                "blocks": blocks,
+                "embeddings": [
+                    {key: value for key, value in entry.items() if key != "vector"}
+                    for entry in piece["embeddings"]
+                    if any(location["page"] == number for location in entry["locations"])
+                ],
+            }, source_blocks))
+    return {**page, "pieces": sections, "source_blocks": source_blocks}
+
+
 def _handler(pdf: Path, bundle: Path) -> type[BaseHTTPRequestHandler]:
     pages_file = bundle / "pages.json"
-    pages = json.loads(pages_file.read_text(encoding="utf-8"))
-    if not isinstance(pages, list) or any(
-        not isinstance(page, dict) or not isinstance(page.get("pieces"), list)
-        for page in pages
-    ):
-        raise ValueError("pages.json must contain a list of pages with pieces")
-
     document_file = bundle / "document.json"
     has_document = document_file.is_file()
+    document = read_document(bundle) if has_document else None
+    resolved = document is not None and document["schema_version"] == 4
+    if resolved:
+        numbers = [page["number"] for page in document["pages"]]
+    else:
+        pages = json.loads(pages_file.read_text(encoding="utf-8"))
+        if not isinstance(pages, list) or any(
+            not isinstance(page, dict) or not isinstance(page.get("pieces"), list)
+            for page in pages
+        ):
+            raise ValueError("pages.json must contain a list of pages with pieces")
+        numbers = list(range(1, len(pages) + 1))
     html_files = {
-        f"/html/page-{number}.html": bundle / "html" / f"page-{number}.html"
-        for number in range(1, len(pages) + 1)
+        f"/html/page-{number}.html": bundle / "html" / f"page-{number}.html" for number in numbers
     }
     html_files = {url: file for url, file in html_files.items() if file.is_file()}
+    stamp = document_file.stat().st_mtime_ns if resolved else None
+
+    def current_document():
+        nonlocal document, stamp
+        updated = document_file.stat().st_mtime_ns
+        if stamp != updated:
+            document = read_document(bundle)
+            stamp = updated
+        return document
+
     class InspectorHandler(BaseHTTPRequestHandler):
         def do_GET(self) -> None:
             _, port = self.server.server_address
@@ -52,20 +93,31 @@ def _handler(pdf: Path, bundle: Path) -> type[BaseHTTPRequestHandler]:
                     "title": pdf.name,
                     "htmlPages": list(html_files),
                     "hasDocument": has_document,
+                    "resolved": resolved,
+                    "parsedPages": numbers,
                     "searchModes": [
                         mode for mode in MODES
-                        if has_document and (bundle / f"embeddings.{mode}.json").is_file()
+                        if (mode in current_document().get("embedding_modes", {}) if resolved
+                            else has_document and (bundle / f"embeddings.{mode}.json").is_file())
                     ],
                 })
+                return
+
+            if resolved and (match := re.fullmatch(r"/api/pages/([1-9][0-9]{0,8})", url)):
+                page = _resolved_page(current_document(), int(match[1]))
+                if page is None:
+                    self._json({"error": "This source page was not parsed."}, status=404)
+                else:
+                    self._json(page)
                 return
 
             if url in _ASSETS:
                 file = _STATIC / _ASSETS[url]
             elif url == "/source.pdf":
                 file = pdf
-            elif url == "/pages.json":
+            elif url == "/pages.json" and not resolved:
                 file = pages_file
-            elif url == "/document.json" and has_document:
+            elif url == "/document.json" and has_document and not resolved:
                 file = document_file
             elif url in html_files:
                 file = html_files[url]
@@ -137,7 +189,7 @@ def _handler(pdf: Path, bundle: Path) -> type[BaseHTTPRequestHandler]:
                 location = next(iter(hit["locations"]), None)
                 if location is None:
                     location = next(
-                        ({"page": number} for number in range(1, len(pages) + 1)
+                        ({"page": number} for number in numbers
                          if piece["id"].startswith(f"p{number}:")),
                         None,
                     )
@@ -148,6 +200,8 @@ def _handler(pdf: Path, bundle: Path) -> type[BaseHTTPRequestHandler]:
                     "image": image,
                     "text": (piece.get("enrichment") or {}).get("description") or hit["text"],
                 })
+                if parent := hit.get("parent_piece"):
+                    results[-1].update(parentPieceId=parent["id"], targetId=hit["id"])
             self._json({"results": results})
 
         def _json(self, data: dict, *, status: int = 200) -> None:
