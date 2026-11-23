@@ -1,13 +1,17 @@
-"""OpenRouter transport for the two opt-in hosted commands."""
+"""OpenRouter transport for the opt-in hosted commands."""
 
 import base64
 import json
+import math
 import os
+from datetime import UTC, datetime
+from email.utils import parsedate_to_datetime
 from time import sleep
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 _URL = "https://openrouter.ai/api/v1"
+_RETRYABLE = {408, 425, 429, 500, 502, 503, 504, 529}
 
 
 class OpenRouterError(ValueError):
@@ -17,12 +21,39 @@ class OpenRouterError(ValueError):
 
     @property
     def blocks_run(self) -> bool:
-        return self.status in {401, 402, 403, 404, 429, 500, 502, 503, 504}
+        return self.status in {401, 402, 403, 404, 408, 425, 429, 500, 502, 503, 504, 529}
 
 
 def image_part(data: bytes, mime: str) -> dict:
     uri = f"data:{mime};base64,{base64.b64encode(data).decode('ascii')}"
     return {"type": "image_url", "image_url": {"url": uri}}
+
+
+def cost_of(response: dict) -> float | None:
+    """Read the per-request cost OpenRouter includes in usage accounting."""
+    usage = response.get("usage")
+    if not isinstance(usage, dict):
+        return None
+    cost = usage.get("cost")
+    if type(cost) not in (int, float) or not math.isfinite(cost) or cost < 0:
+        return None
+    return float(cost)
+
+
+def _retry_after(headers) -> float | None:
+    value = (headers.get("Retry-After") or "").strip()
+    if not value:
+        return None
+    try:
+        return float(value)
+    except ValueError:
+        try:
+            retry_at = parsedate_to_datetime(value)
+        except (TypeError, ValueError):
+            return None
+        if retry_at.tzinfo is None:
+            retry_at = retry_at.replace(tzinfo=UTC)
+        return max(0.0, (retry_at - datetime.now(UTC)).total_seconds())
 
 
 def post(endpoint: str, payload: dict) -> dict:
@@ -48,10 +79,16 @@ def post(endpoint: str, payload: dict) -> dict:
             return result
         except HTTPError as exc:
             try:
-                retry_after = exc.headers.get("Retry-After", "")
-                delay = float(retry_after) if retry_after.isdecimal() else 1
-                if attempt == 0 and exc.code in {429, 500, 502, 503, 504} and delay <= 5:
-                    sleep(max(1, delay))
+                delay = _retry_after(exc.headers)
+                # A short throttle can be retried once. A long Retry-After means
+                # the quota is exhausted, so return control and let the caller
+                # save completed work instead of hammering the endpoint.
+                if (
+                    attempt == 0
+                    and exc.code in _RETRYABLE
+                    and (delay is None or delay <= 5)
+                ):
+                    sleep(max(1.0, delay or 0.0))
                     continue
                 message = f"OpenRouter returned HTTP {exc.code}"
                 if exc.code == 429:

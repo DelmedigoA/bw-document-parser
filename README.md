@@ -31,8 +31,12 @@ ordered list of image references.
 Image markers are zero-based within each piece. Resolve local image paths
 relative to `pages.json`. Identical embedded images share one file.
 
-The parser reuses one standard Docling converter and exports each page to HTML
-in memory. Converting pages separately keeps paragraphs on their source pages.
+The parser reuses one standard Docling converter and converts the PDF in page
+batches (12 pages by default) so Docling's internal layout, table, and OCR
+batches can fill. A page-boundary patch stops Docling from joining a paragraph
+across two pages, and piece IDs are renumbered per page so they stay identical
+to a page-at-a-time conversion. Raise `--page-batch-size` (or
+`BW_PARSER_PAGE_BATCH`) for fewer conversion setups at the cost of peak memory.
 Headings start sections, and long sections repeat their heading across pieces.
 The chunker aims for 400 text tokens and splits at 850 when possible.
 Tables, figures, and blocks with images stay intact and may exceed that limit.
@@ -68,6 +72,11 @@ uv run bw-document-embed parsed-report
 uv run bw-document-search parsed-report "verified incidents by district"
 ```
 
+Enrichment sends independent figures concurrently. The default is 4 requests
+at once; set `--workers` or `BW_ENRICH_WORKERS` to change it. Each completed
+figure is saved immediately, so a quota failure or interrupt keeps the paid
+results and a rerun only requests the missing figures.
+
 The default embedding model is `nvidia/nemotron-3.5-embed-8b:free`. The
 `embeddings.multimodal.json` sidecar stores search text, 4,096-dimensional
 vectors, and links to the original pieces and pages. Table rows are searchable
@@ -80,6 +89,18 @@ and reports the failure. Rerun it after the quota resets. A different model ID
 can be selected explicitly with `--model`; the unsuffixed
 `nvidia/nemotron-3.5-embed-8b` currently has no active OpenRouter endpoint.
 Switching models rebuilds the vectors for that mode.
+
+Text inputs are sent in batches: 64 per request for OpenAI text embeddings, 8
+for Nemotron, and 1 for Titan. Up to four requests run at once. Use
+`--batch-size` and `--workers` (or `BW_EMBED_WORKERS`) to tune them. Vectors are
+matched by each response item's own index, so an out-of-order reply cannot
+attach a vector to the wrong piece. A rejected batch falls back to single
+requests, and only the inputs missing from a partial reply are requested again.
+The sidecar records OpenRouter's reported cost under `billing.total_cost`.
+Per-page shares of a multi-input batch are labeled `estimated` because the
+provider reports one cost per request; a single-input request is `exact`.
+Completed batches are saved when a quota error stops the run, and rerunning
+reuses them.
 
 For a paid multimodal alternative, run
 `uv run bw-document-embed parsed-report --model amazon/titan-embed-image-v1`.

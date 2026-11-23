@@ -270,9 +270,9 @@ def parse_page(html: str, save_image: Callable[[str], str]) -> Page:
     for group in groups:
         piece_urls: list[str] = []
 
-        def local_marker(match: re.Match[str]) -> str:
-            piece_urls.append(image_urls[int(match[1])])
-            return f"[image:{len(piece_urls) - 1}]"
+        def local_marker(match: re.Match[str], urls: list[str] = piece_urls) -> str:
+            urls.append(image_urls[int(match[1])])
+            return f"[image:{len(urls) - 1}]"
 
         pieces.append(
             Piece(text=_IMAGE.sub(local_marker, _join(group)), image_urls=piece_urls)

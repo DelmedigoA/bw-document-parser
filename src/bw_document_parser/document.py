@@ -73,6 +73,9 @@ class FigureEnrichment:
     fingerprint: str
     image_paths: list[str]
     decorative: bool = False
+    # OpenRouter reports one cost for this request; a figure is one request,
+    # so the figure's first location attributes the cost exactly.
+    cost: float | None = None
 
 
 @dataclass(frozen=True)
