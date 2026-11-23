@@ -331,6 +331,12 @@ def embed_bundle(
                 and "input_fingerprint" in item
                 and _valid_vector(item.get("vector"), dimensions)
             }
+        cached_costs = {}
+        for item in old.get("entries", []):
+            key = item.get("input_fingerprint")
+            cost = item.get("cost")
+            if key in cached and type(cost) in (int, float) and math.isfinite(cost):
+                cached_costs[key] = cached_costs.get(key, 0.0) + cost
         entries = {}
         pending: dict[str, _Work] = {}
         sources = list(search_entries(
@@ -349,9 +355,6 @@ def embed_bundle(
                         "input_fingerprint": identity,
                         "vector": previous["vector"],
                     }
-                    for name in ("cost", "cost_allocation"):
-                        if name in previous:
-                            entry[name] = previous[name]
                     entries[source.id] = entry
                     continue
                 work = pending.get(identity)
@@ -367,6 +370,15 @@ def embed_bundle(
                     work.sources.append(source)
             except (OSError, ValueError) as exc:
                 print(f"{source.id}: {exc}", file=sys.stderr)
+
+        cached_groups = {}
+        for entry in entries.values():
+            cached_groups.setdefault(entry["input_fingerprint"], []).append(entry)
+        for key, group in cached_groups.items():
+            if key in cached_costs:
+                for entry in group:
+                    entry["cost"] = cached_costs[key] / len(group)
+                    entry["cost_allocation"] = "estimated" if len(group) > 1 else cached[key].get("cost_allocation", "estimated")
 
         reused = len(entries)
         writer = JsonWriter(path)
@@ -401,8 +413,12 @@ def embed_bundle(
                     pool.submit(_execute_batch, batch, model, dimensions, stop): batch
                     for batch in work_batches
                 }
-                try:
-                    for future in as_completed(futures):
+                remaining = set(futures)
+                interrupted = None
+                while remaining:
+                    try:
+                        future = next(as_completed(remaining))
+                        remaining.remove(future)
                         try:
                             outcome = future.result()
                         except CancelledError:
@@ -445,11 +461,15 @@ def embed_bundle(
                             stop.set()
                             for pending_future in futures:
                                 pending_future.cancel()
-                except BaseException:
-                    # Keep the batches that already finished when the user
-                    # interrupts the process.
+                    except (Exception, KeyboardInterrupt) as exc:  # noqa: BLE001 -- drain paid work before reraising
+                        if interrupted is None:
+                            interrupted = exc
+                        stop.set()
+                        for pending_future in remaining:
+                            pending_future.cancel()
+                if interrupted is not None:
                     writer.write(snapshot())
-                    raise
+                    raise interrupted
 
         complete = len(entries) == len(sources)
         if not complete and not entries and old.get("entries"):

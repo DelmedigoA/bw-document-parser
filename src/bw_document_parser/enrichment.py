@@ -187,41 +187,54 @@ def enrich_bundle(bundle: Path, *, workers: int | None = None) -> bool:
         if jobs:
             with ThreadPoolExecutor(max_workers=workers) as pool:
                 futures = {pool.submit(run, job): job for job in jobs}
-                for future in as_completed(futures):
+                remaining = set(futures)
+                interrupted = None
+                while remaining:
                     try:
-                        result = future.result()
-                    except CancelledError:
-                        continue
-                    job = result.job
-                    if job is None:
-                        continue
-                    if result.error is not None:
-                        print(f"{job.piece['id']}: {result.error}", file=sys.stderr)
-                        failed += 1
-                        if (
-                            isinstance(result.error, openrouter.OpenRouterError)
-                            and result.error.blocks_run
-                        ):
-                            stop.set()
-                            for pending in futures:
-                                pending.cancel()
-                        continue
-                    description = result.description
-                    job.piece["enrichment"] = asdict(FigureEnrichment(
-                        description.description,
-                        description.visible_text,
-                        MODEL,
-                        FIGURE_DESCRIPTION_VERSION,
-                        job.identity,
-                        asset_paths(job.piece),
-                        description.decorative,
-                        description.cost,
-                    ))
-                    omitted += int(description.decorative)
-                    enriched += int(not description.decorative)
-                    # Persist each completed request so a later quota or
-                    # interrupt can resume without repeating paid work.
-                    writer.write(document)
+                        future = next(as_completed(remaining))
+                        remaining.remove(future)
+                        try:
+                            result = future.result()
+                        except CancelledError:
+                            continue
+                        job = result.job
+                        if job is None:
+                            continue
+                        if result.error is not None:
+                            print(f"{job.piece['id']}: {result.error}", file=sys.stderr)
+                            failed += 1
+                            if (
+                                isinstance(result.error, openrouter.OpenRouterError)
+                                and result.error.blocks_run
+                            ):
+                                stop.set()
+                                for pending in futures:
+                                    pending.cancel()
+                            continue
+                        description = result.description
+                        job.piece["enrichment"] = asdict(FigureEnrichment(
+                            description.description,
+                            description.visible_text,
+                            MODEL,
+                            FIGURE_DESCRIPTION_VERSION,
+                            job.identity,
+                            asset_paths(job.piece),
+                            description.decorative,
+                            description.cost,
+                        ))
+                        omitted += int(description.decorative)
+                        enriched += int(not description.decorative)
+                        # Persist each completed request so a later quota or
+                        # interrupt can resume without repeating paid work.
+                        writer.write(document)
+                    except (Exception, KeyboardInterrupt) as exc:  # noqa: BLE001 -- drain paid work before reraising
+                        if interrupted is None:
+                            interrupted = exc
+                        stop.set()
+                        for pending in remaining:
+                            pending.cancel()
+                if interrupted is not None:
+                    raise interrupted
 
         print(
             f"Figures enriched: {enriched}, decorative: {omitted}, reused: {reused}, "

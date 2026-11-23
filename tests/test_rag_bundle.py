@@ -654,3 +654,62 @@ class DoclingPageTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class ReviewRegressionTests(unittest.TestCase):
+    def test_cached_duplicate_cost_is_redistributed_when_occurrences_change(self):
+        from dataclasses import replace
+
+        with TemporaryDirectory() as directory:
+            bundle = Path(directory)
+            text_bundle(bundle)
+            source = next(iter(search_entries(read_json(bundle / 'document.json'), multimodal=False)))
+            with patch.object(embeddings, 'search_entries', return_value=[source, replace(source, id='duplicate')]), \
+                 patch.object(openrouter, 'post', side_effect=lambda _, payload: vectors_for(payload, cost=0.02)):
+                self.assertTrue(embeddings.embed_bundle(bundle, 'text', workers=1))
+            with patch.object(embeddings, 'search_entries', return_value=[source]), \
+                 patch.object(openrouter, 'post', side_effect=AssertionError('unexpected request')):
+                self.assertTrue(embeddings.embed_bundle(bundle, 'text', workers=1))
+            index = read_json(bundle / 'embeddings.text.json')
+            self.assertAlmostEqual(index['billing']['total_cost'], 0.02)
+
+    def test_interrupt_drains_finished_embedding_requests(self):
+        from concurrent.futures import as_completed as real_as_completed
+
+        with TemporaryDirectory() as directory:
+            bundle = Path(directory)
+            text_bundle(bundle)
+            calls = 0
+            def interrupt_once(futures):
+                nonlocal calls
+                calls += 1
+                if calls == 1:
+                    next(real_as_completed(futures))
+                    raise KeyboardInterrupt()
+                return real_as_completed(futures)
+            with patch.object(embeddings, 'as_completed', side_effect=interrupt_once), \
+                 patch.object(openrouter, 'post', side_effect=lambda _, payload: vectors_for(payload)), \
+                 self.assertRaises(KeyboardInterrupt):
+                embeddings.embed_bundle(bundle, 'text', workers=1, batch_size=3)
+            index = read_json(bundle / 'embeddings.text.json')
+            self.assertEqual(len(index['entries']), 3)
+
+    def test_interrupt_drains_finished_enrichment_requests(self):
+        from concurrent.futures import as_completed as real_as_completed
+
+        with TemporaryDirectory() as directory:
+            bundle = Path(directory)
+            example_bundle(bundle)
+            calls = 0
+            def interrupt_once(futures):
+                nonlocal calls
+                calls += 1
+                if calls == 1:
+                    next(real_as_completed(futures))
+                    raise KeyboardInterrupt()
+                return real_as_completed(futures)
+            with patch.object(enrichment, 'as_completed', side_effect=interrupt_once), \
+                 patch.object(openrouter, 'post', return_value=description('A figure')), \
+                 self.assertRaises(KeyboardInterrupt):
+                enrichment.enrich_bundle(bundle, workers=1)
+            document = read_json(bundle / 'document.json')
+            self.assertTrue(any(piece.get('enrichment') for piece in document['pieces']))
