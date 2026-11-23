@@ -10,26 +10,31 @@ Use Python 3.11–3.14 and [uv](https://docs.astral.sh/uv/). Pick a new output
 directory. On the first run, Docling and tiktoken may download model files and
 tokenizer data. The PDF is processed locally. No API key is required.
 
-The compatibility output, `pages.json`, has one entry per source page in PDF order.
-A blank page has an empty `pieces` list. Each piece has a text string and an
-ordered list of image references.
+Walk through page 1 of the bundled example in
+[`examples/pdf_pipeline_piece_parts.ipynb`](examples/pdf_pipeline_piece_parts.ipynb).
 
-```json
-[
-  {
-    "pieces": [
-      {
-        "text": "## Findings\n\n[image:0]\nCaption: Survey results",
-        "image_urls": ["images/38d6df2d08c4a55ffcbc1947.png"]
-      }
-    ]
-  },
-  {"pieces": []}
-]
+```sh
+doppler run --project bearingwitness --config dev_archiveai --only-secrets OPENROUTER_API_KEY -- \
+  uv run --with jupyterlab --with ipykernel jupyter lab examples/pdf_pipeline_piece_parts.ipynb
 ```
 
-Image markers are zero-based within each piece. Resolve local image paths
-relative to `pages.json`. Identical embedded images share one file.
+Parse writes a `parsed.json` checkpoint, Docling HTML, and image assets. Resolve
+writes the canonical `document.json`, with ordered pieces under their
+source pages. Each piece has a `textual_part` with readable text and any table
+HTML, and a `visual_part` with image URLs and optional descriptions. Either
+part can be null. Source IDs point to the original blocks and their locations.
+Enrich and Embed add to that document. They retain the piece IDs and the source blocks used for citations.
+
+```sh
+uv run bw-document-parser report.pdf --output-dir page-one --page-range 1 1 --parse-only
+uv run bw-document-resolve page-one
+```
+
+`bw-document-resolve` also accepts existing bundles with a version 2
+`document.json`. It saves the existing structured parse as a checkpoint and
+writes the resolved document in the bundle. Existing indexes can supply cached
+vectors to the next embedding run when the model and inputs match. Older bundles
+remain readable by the inspector without converting them.
 
 The parser reuses one standard Docling converter and converts the PDF in page
 batches (12 pages by default) so Docling's internal layout, table, and OCR
@@ -37,9 +42,11 @@ batches can fill. A page-boundary patch stops Docling from joining a paragraph
 across two pages, and piece IDs are renumbered per page so they stay identical
 to a page-at-a-time conversion. Raise `--page-batch-size` (or
 `BW_PARSER_PAGE_BATCH`) for fewer conversion setups at the cost of peak memory.
-Headings start sections, and long sections repeat their heading across pieces.
-The chunker aims for 400 text tokens and splits at 850 when possible.
-Tables, figures, and blocks with images stay intact and may exceed that limit.
+The resolver groups adjacent prose on each page. It uses 100 tokens as a soft
+minimum, aims for 400, and caps prose at 850 tokens. Headings, figures, and
+tables start new groups. Tables and figures retain their linked titles,
+captions, footnotes, and notes. Embedding can split large inputs into smaller
+targets without changing the document's pieces.
 
 Run the offline tests with `uv run python -m unittest discover -s tests`.
 
@@ -48,7 +55,7 @@ Run the offline tests with `uv run python -m unittest discover -s tests`.
 Docling 2.152.0 runs the standard pipeline with Heron, TableFormer V1 in
 accurate mode, and RapidOCR 3.10.0 on PyTorch. Every new bundle includes
 `document.json` with the PDF's SHA-256 ID and typed pieces in reading order.
-Pages reference top-level piece IDs. Figures reference images, published captions,
+Pages contain the resolved pieces that open on that page. Figures reference images, published captions,
 and any children Docling links. Tables preserve Docling's HTML, including merged
 cells. Locations use one-based page numbers and bounding boxes as
 `[left, top, right, bottom]` fractions of the displayed page.
@@ -58,9 +65,15 @@ sends saved figure images, their published captions, and section headings to
 `tencent/hy4-flash`. It adds a description and optional model-transcribed text
 to each figure. Source captions, OCR text, and tables remain independently
 addressable. Rerunning the command reuses successful descriptions for unchanged
-inputs. Figures marked decorative are omitted from the Pieces view and search
-index. The source bundle retains their images and their original Docling HTML.
-Rerun enrichment and embedding on an older bundle to apply a new prompt version.
+inputs. Rerun enrichment and embedding on an older bundle to apply a new
+prompt version.
+
+For resolved bundles, Enrich first asks Perplexity Decider V1.2 whether the
+picture would add information beyond its heading and caption. A probability
+of at least 0.5 sends it to Hy4 Flash. A skipped picture moves out of the
+piece’s visual part and stays with its source block for provenance. The
+decision is saved and reused when the image and context match. An API error leaves the figure
+available for retry.
 
 Model prompts and their versions live in `src/bw_document_parser/prompts/`.
 When changing a prompt, bump its version in that directory so the next
@@ -77,9 +90,9 @@ at once; set `--workers` or `BW_ENRICH_WORKERS` to change it. Each completed
 figure is saved immediately, so a quota failure or interrupt keeps the paid
 results and a rerun only requests the missing figures.
 
-The default embedding model is `nvidia/nemotron-3.5-embed-8b:free`. The
-`embeddings.multimodal.json` sidecar stores search text, 4,096-dimensional
-vectors, and links to the original pieces and pages. Table rows are searchable
+The default embedding mode is text, using `openai/text-embedding-3-small`.
+Pass `--mode multimodal` to use `nvidia/nemotron-3.5-embed-8b:free`. In that mode, targets store search text, 4,096-dimensional vectors, and source
+references on the resolved pieces. Table rows are searchable
 as text, and available table crops and figures also receive image-and-text
 vectors. NVIDIA's free endpoint excludes confidential information and personal
 data. Use public, non-personal or synthetic examples for hosted smoke tests.
@@ -96,14 +109,14 @@ for Nemotron, and 1 for Titan. Up to four requests run at once. Use
 matched by each response item's own index, so an out-of-order reply cannot
 attach a vector to the wrong piece. A rejected batch falls back to single
 requests, and only the inputs missing from a partial reply are requested again.
-The sidecar records OpenRouter's reported cost under `billing.total_cost`.
+The embedding mode metadata records OpenRouter's reported cost under `billing.total_cost`.
 Per-page shares of a multi-input batch are labeled `estimated` because the
 provider reports one cost per request; a single-input request is `exact`.
 Completed batches are saved when a quota error stops the run, and rerunning
 reuses them.
 
 For a paid multimodal alternative, run
-`uv run bw-document-embed parsed-report --model amazon/titan-embed-image-v1`.
+`uv run bw-document-embed parsed-report --mode multimodal --model amazon/titan-embed-image-v1`.
 Titan writes 1,024-dimensional vectors and uses smaller chunks to fit
 OpenRouter's text limit. Amazon documents English as the supported text language.
 The search command reads the model from the bundle.
@@ -113,10 +126,10 @@ uv run bw-document-embed parsed-report --mode text
 uv run bw-document-search parsed-report "verified incidents by district" --mode text
 ```
 
-Text mode writes `embeddings.text.json` with 1,536-dimensional vectors from
+Text mode stores 1,536-dimensional vectors from
 `openai/text-embedding-3-small` and sends no images to the embedding endpoint.
-Search uses the model recorded in the chosen sidecar and returns the matching
-pieces, including HTML and locations for tables. Rerun embedding after updating
+Search uses the model recorded for the selected mode and returns the matching
+target and its parent piece, including source locations. Rerun embedding after updating
 a bundle's descriptions. For Hebrew, verify representative queries against
 known text and image targets before relying on the default model in production.
 

@@ -12,6 +12,8 @@ from tempfile import NamedTemporaryFile
 from filelock import FileLock
 from PIL import Image
 
+from .document import upgrade_resolved
+
 
 def read_json(path: Path) -> dict:
     data = json.loads(path.read_text(encoding="utf-8"))
@@ -69,9 +71,9 @@ def document_lock(bundle: Path) -> FileLock:
 
 def read_document(bundle: Path) -> dict:
     document = read_json(bundle / "document.json")
-    if document.get("schema_version") != 2:
-        raise ValueError("reparse the PDF to produce a version 2 document.json")
-    return document
+    if document.get("schema_version") not in {2, 3, 4}:
+        raise ValueError("unsupported document.json schema")
+    return upgrade_resolved(document)
 
 
 def text_of(piece: dict) -> str:

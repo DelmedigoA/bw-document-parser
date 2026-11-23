@@ -96,9 +96,9 @@ def replace_page(location: Location, page: int) -> Location:
     return Location(page, location.bbox, location.text_range)
 
 
-def description(text: str | None, *, decorative: bool = False) -> dict:
+def description(text: str) -> dict:
     return {"choices": [{"finish_reason": "stop", "message": {
-        "content": json.dumps({"decorative": decorative, "description": text, "visible_text": None if decorative else "צפון"}),
+        "content": json.dumps({"description": text, "visible_text": "צפון"}),
     }}]}
 
 
@@ -202,6 +202,10 @@ class HostedTests(unittest.TestCase):
             self.assertEqual("chat/completions", endpoint)
             self.assertEqual("tencent/hy4-flash", payload["model"])
             self.assertTrue(payload["response_format"]["json_schema"]["strict"])
+            self.assertEqual(
+                {"description", "visible_text"},
+                set(payload["response_format"]["json_schema"]["schema"]["properties"]),
+            )
             self.assertIn("Incident review", payload["messages"][1]["content"][0]["text"])
             self.assertEqual("image_url", payload["messages"][1]["content"][1]["type"])
         document = read_json(self.bundle / "document.json")
@@ -217,29 +221,21 @@ class HostedTests(unittest.TestCase):
 
     def test_accepts_fenced_description_without_optional_transcription(self):
         reply = description("Unused")
-        reply["choices"][0]["message"]["content"] = '```json\n{"decorative":false,"description":"Chart"}\n```'
+        reply["choices"][0]["message"]["content"] = '```json\n{"description":"Chart"}\n```'
         with patch.object(openrouter, "post", return_value=reply) as request:
-            self.assertEqual(("Chart", None, False), enrichment.describe({}, []))
+            self.assertEqual(("Chart", None), enrichment.describe({}, []))
             payload = request.call_args.args[1]
             self.assertEqual({"effort": "none"}, payload["reasoning"])
             self.assertEqual(4096, payload["max_tokens"])
 
-    def test_decorative_figures_are_cached_and_omitted_from_search(self):
-        with patch.object(openrouter, "post", side_effect=[
-            description("Chart"), description(None, decorative=True),
-        ]):
-            self.assertTrue(enrichment.enrich_bundle(self.bundle, workers=1))
+    def test_legacy_decorative_figures_are_omitted_from_search(self):
         doc = read_json(self.bundle / "document.json")
         logo = next(piece for piece in doc["pieces"] if piece["id"] == "other")
-        self.assertTrue(logo["enrichment"]["decorative"])
-        self.assertIsNone(logo["enrichment"]["description"])
+        logo["enrichment"] = {"decorative": True, "description": None, "visible_text": None}
         self.assertTrue(logo["images"])
         entries = list(search_entries(doc, multimodal=True))
         self.assertTrue(any("figure" in entry.piece_ids for entry in entries))
         self.assertFalse(any("other" in entry.piece_ids for entry in entries))
-        with patch.object(openrouter, "post") as post:
-            self.assertTrue(enrichment.enrich_bundle(self.bundle, workers=1))
-            post.assert_not_called()
 
     def test_reports_truncation_without_printing_response_content(self):
         reply = description("Private figure text")

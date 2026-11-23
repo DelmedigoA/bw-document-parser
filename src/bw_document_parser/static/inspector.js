@@ -32,6 +32,7 @@ let total;
 let page = 1;
 let zoom = 1;
 let mode = "html";
+let pageRevision = 0;
 
 async function fetchJson(url) {
   const response = await fetch(url);
@@ -83,15 +84,15 @@ function renderTable(htmlText) {
   return source ? copy(source) : document.createDocumentFragment();
 }
 
-function renderStructure(current) {
+function renderStructure(current, {resolved = false} = {}) {
   const pieces = current.piece_ids.map(id => piecesById.get(id)).filter(Boolean);
   const owned = new Set(pieces.flatMap(piece => [
-    ...piece.children, ...piece.caption_ids, ...piece.footnote_ids,
+    ...piece.children, ...piece.caption_ids, ...piece.footnote_ids, piece.inferred_title_id, ...(piece.inferred_note_ids ?? []),
     ...(piece.content.cells ?? []).flatMap(cell => cell.child_ids),
   ]));
 
   function render(piece, ancestors = new Set()) {
-    if (!piece || piece.enrichment?.decorative === true || ancestors.has(piece.id)) {
+    if (!piece || ancestors.has(piece.id) || (!resolved && piece.enrichment?.decorative === true)) {
       return document.createDocumentFragment();
     }
     const path = new Set([...ancestors, piece.id]);
@@ -104,36 +105,46 @@ function renderStructure(current) {
     node.className = "chunk";
     node.dataset.pieceId = piece.id;
     node.dir = "auto";
-    if (content.kind === "table" && typeof content.html === "string") {
-      const table = renderTable(content.html);
-      if (table instanceof HTMLTableElement && piece.caption_ids.length) {
-        table.createCaption().append(...piece.caption_ids.map(renderId));
+    const images = piece.images.flatMap(image => {
+      if (!/^images\/[0-9a-f]{24}\.[a-zA-Z0-9]+$/u.test(image.path)) return [];
+      const img = document.createElement("img");
+      img.src = `/${image.path}`;
+      img.alt = content.kind === "table" ? "Extracted table image" : "Extracted figure";
+      return [img];
+    });
+    if (content.kind === "table") {
+      const table = typeof content.html === "string" ? renderTable(content.html) : document.createElement("table");
+      if (content.cells) {
+        const rows = Array.from({length: content.row_count}, () => table.insertRow());
+        const cells = [...content.cells].sort((a, b) => a.row - b.row || a.column - b.column);
+        for (const cell of cells) {
+          const header = cell.roles.includes("column_header") || cell.roles.includes("row_header");
+          const td = document.createElement(header ? "th" : "td");
+          td.rowSpan = cell.row_span;
+          td.colSpan = cell.column_span;
+          if (cell.child_ids.length) td.append(...cell.child_ids.map(renderId));
+          else td.textContent = cell.text;
+          rows[cell.row]?.append(td);
+        }
+      }
+      const inferred = piece.inferred_title_id;
+      const captions = inferred ? [inferred] : piece.caption_ids;
+      if (table instanceof HTMLTableElement && captions.length) {
+        const caption = table.createCaption();
+        if (inferred) caption.className = "inferred-table-caption";
+        caption.append(...captions.map(renderId));
       }
       node.append(table);
-    } else if (content.kind === "table") {
-      const table = document.createElement("table");
-      const rows = Array.from({length: content.row_count}, () => table.insertRow());
-      const cells = [...content.cells].sort((a, b) => a.row - b.row || a.column - b.column);
-      for (const cell of cells) {
-        const header = cell.roles.includes("column_header") || cell.roles.includes("row_header");
-        const td = document.createElement(header ? "th" : "td");
-        td.rowSpan = cell.row_span;
-        td.colSpan = cell.column_span;
-        if (cell.child_ids.length) td.append(...cell.child_ids.map(renderId));
-        else td.textContent = cell.text;
-        rows[cell.row]?.append(td);
+      if (resolved && images.length) {
+        const details = document.createElement("details");
+        const summary = document.createElement("summary");
+        summary.textContent = images.length === 1 ? "Table image" : "Table images";
+        details.append(summary, ...images);
+        node.append(details);
       }
-      if (piece.caption_ids.length) table.createCaption().append(...piece.caption_ids.map(renderId));
-      node.append(table);
     } else {
       node.textContent = content.text ?? content.data?.state ?? "";
-      for (const image of piece.images) {
-        if (!/^images\/[0-9a-f]{24}\.[a-zA-Z0-9]+$/u.test(image.path)) continue;
-        const img = document.createElement("img");
-        img.src = `/${image.path}`;
-        img.alt = "Extracted figure";
-        node.append(img);
-      }
+      node.append(...images);
       if (tag !== "figure" && piece.caption_ids.length) {
         const caption = document.createElement("div");
         caption.append(...piece.caption_ids.map(renderId));
@@ -146,6 +157,12 @@ function renderStructure(current) {
     const collapsedIds = new Set(extractedText);
     node.append(...[...piece.children, ...piece.footnote_ids]
       .filter(id => !collapsedIds.has(id)).map(renderId));
+    if (piece.inferred_note_ids?.length) {
+      const notes = document.createElement("div");
+      notes.className = "table-notes";
+      notes.append(...piece.inferred_note_ids.map(renderId));
+      node.append(notes);
+    }
     if (tag === "figure") {
       const caption = document.createElement("figcaption");
       caption.append(...piece.caption_ids.map(renderId));
@@ -165,7 +182,7 @@ function renderStructure(current) {
         section.append(heading, text);
         caption.append(section);
       }
-      if (extractedText.length) {
+      if (!resolved && extractedText.length) {
         const section = document.createElement("details");
         section.className = "figure-enrichment";
         const summary = document.createElement("summary");
@@ -174,6 +191,7 @@ function renderStructure(current) {
         caption.append(section);
       }
       if (caption.hasChildNodes()) node.append(caption);
+      if (resolved && !node.hasChildNodes()) return document.createDocumentFragment();
     }
     return node;
   }
@@ -205,20 +223,27 @@ function searchResult(hit) {
   button.append(content);
   button.addEventListener("click", () => {
     mode = "structure";
-    showPage(hit.page);
-    const piece = preview.querySelector(`[data-piece-id="${CSS.escape(hit.pieceId)}"]`);
-    if (piece) {
-      for (let section = piece.closest("details"); section; section = section.parentElement.closest("details")) {
-        section.open = true;
-      }
-      piece.classList.add("search-target");
-      piece.tabIndex = -1;
-      piece.focus({preventScroll: true});
-      piece.scrollIntoView({block: "nearest"});
-    }
+    showPage(hit.page).then(shown => {
+      if (!shown) return;
+      highlightResult(hit);
+    });
   });
   item.append(button);
   return item;
+}
+
+function highlightResult(hit) {
+  const piece = preview.querySelector(`[data-piece-id="${CSS.escape(hit.pieceId)}"]`) ??
+    (hit.parentPieceId && preview.querySelector(`[data-section-id="${CSS.escape(hit.parentPieceId)}"]`));
+  if (piece) {
+    for (let section = piece.closest("details"); section; section = section.parentElement.closest("details")) {
+      section.open = true;
+    }
+    piece.classList.add("search-target");
+    piece.tabIndex = -1;
+    piece.focus({preventScroll: true});
+    piece.scrollIntoView({block: "nearest"});
+  }
 }
 
 async function runSearch(event) {
@@ -249,7 +274,63 @@ async function runSearch(event) {
   }
 }
 
-function showParsedPage() {
+const collapsedPieces = new Set();
+
+function renderResolved(current) {
+  piecesById = new Map();
+  for (const piece of current.pieces) {
+    const tables = new Map((piece.textual_part?.tables ?? []).map(table => [table.source_id, table.html]));
+    const images = new Map();
+    for (const image of piece.visual_part ?? []) {
+      if (!images.has(image.source_id)) images.set(image.source_id, []);
+      images.get(image.source_id).push(image);
+    }
+    for (const id of piece.source_ids) {
+      const source = current.source_blocks[id];
+      const visuals = images.get(id) ?? [];
+      const content = tables.has(id) ? {...source.content, html: tables.get(id)} : source.content;
+      const enrichment = visuals.length ? {
+        description: visuals[0].description, visible_text: visuals[0].transcription,
+      } : null;
+      piecesById.set(id, {
+        ...source, content, enrichment,
+        images: visuals.map(image => ({path: image.url, location: image.location})),
+      });
+    }
+  }
+  return current.pieces.flatMap(piece => {
+    const blocks = renderStructure({piece_ids: piece.source_ids}, {resolved: true});
+    if (!blocks.some(block => block instanceof HTMLElement)) return [];
+    const section = document.createElement("details");
+    section.className = "resolved-section";
+    section.dataset.sectionId = piece.id;
+    section.open = !collapsedPieces.has(piece.id);
+    section.addEventListener("toggle", () => {
+      if (section.open) collapsedPieces.delete(piece.id);
+      else collapsedPieces.add(piece.id);
+    });
+    const summary = document.createElement("summary");
+    const heading = blocks[0];
+    if (
+      heading instanceof HTMLElement && heading.matches("h1, h2, h3, h4, h5, h6")
+      && heading.textContent.trim() === piece.title
+    ) {
+      summary.append(blocks.shift());
+    } else {
+      summary.textContent = piece.title || "Untitled piece";
+    }
+    const body = document.createElement("div");
+    body.className = "resolved-section-body";
+    body.append(...blocks);
+    section.append(summary, body);
+    return [section];
+  });
+}
+
+async function showParsedPage() {
+  const revision = ++pageRevision;
+  const number = page;
+  const selectedMode = mode;
   structureMode.setAttribute("aria-pressed", String(mode === "structure"));
   htmlMode.setAttribute("aria-pressed", String(mode === "html"));
   jsonMode.setAttribute("aria-pressed", String(mode === "json"));
@@ -259,6 +340,43 @@ function showParsedPage() {
   if (mode === "search") {
     searchPanel.hidden = false;
     return;
+  }
+
+  if (config.resolved) {
+    if (!config.parsedPages.includes(number)) {
+      parsedStatus.textContent = `No parser output for page ${number}.`;
+      return false;
+    }
+    const url = `/html/page-${number}.html`;
+    if (selectedMode === "html" && config.htmlPages.includes(url)) {
+      if (html.getAttribute("src") !== url) html.src = url;
+      html.hidden = false;
+      parsedStatus.hidden = true;
+      return true;
+    }
+    parsedStatus.textContent = "Loading parsed page…";
+    try {
+      const current = await fetchJson(`/api/pages/${number}`);
+      if (revision !== pageRevision) return false;
+      if (selectedMode === "json") {
+        json.textContent = JSON.stringify(current, null, 2);
+        json.hidden = false;
+        json.scrollTop = 0;
+      } else {
+        preview.replaceChildren(...renderResolved(current));
+        preview.hidden = false;
+        preview.scrollTop = 0;
+        if (!preview.childElementCount) {
+          parsedStatus.textContent = "This page has no pieces to display.";
+          return true;
+        }
+      }
+      parsedStatus.hidden = true;
+      return true;
+    } catch (error) {
+      if (revision === pageRevision) parsedStatus.textContent = error.message;
+      return false;
+    }
   }
 
   const current = pages[page - 1];
@@ -274,7 +392,9 @@ function showParsedPage() {
       const piece = piecesById.get(id);
       if (!piece || ordered.has(id)) return;
       ordered.set(id, piece);
-      for (const related of [...piece.children, ...piece.caption_ids, ...piece.footnote_ids]) {
+      for (const related of [
+        ...piece.children, ...piece.caption_ids, ...piece.footnote_ids, piece.inferred_title_id, ...(piece.inferred_note_ids ?? []),
+      ]) {
         collect(related);
       }
     }
@@ -319,14 +439,14 @@ function showParsedPage() {
   }
 }
 
-function showPage(number) {
+async function showPage(number) {
   page = Math.max(1, Math.min(total, Math.round(number) || 1));
   pageInput.value = page;
   prev.disabled = page === 1;
   next.disabled = page === total;
   scroll.scrollTop = 0;
-  showParsedPage();
   viewer.show(page, zoom);
+  return (await showParsedPage()) ?? true;
 }
 
 function setZoom(value) {
@@ -340,16 +460,19 @@ function setZoom(value) {
 async function start() {
   htmlMode.disabled = jsonMode.disabled = structureMode.disabled = true;
   try {
-    const [viewerModule, inspectorConfig, parsedPages] = await Promise.all([
+    const [viewerModule, inspectorConfig] = await Promise.all([
       import("./document-viewer.js"),
       fetchJson("/config.json"),
-      fetchJson("/pages.json"),
     ]);
     config = inspectorConfig;
-    pages = parsedPages;
+    if (!config.resolved) {
+      pages = await fetchJson("/pages.json");
+      if (config.hasDocument) {
+        structure = await fetchJson("/document.json");
+        piecesById = new Map(structure.pieces.map(piece => [piece.id, piece]));
+      }
+    }
     if (config.hasDocument) {
-      structure = await fetchJson("/document.json");
-      piecesById = new Map(structure.pieces.map(piece => [piece.id, piece]));
       structureMode.hidden = false;
       mode = "structure";
     }
@@ -391,7 +514,7 @@ async function start() {
       viewer.show(page, zoom);
     }).observe(scroll);
 
-    showPage(1);
+    showPage(config.parsedPages?.[0] ?? 1);
   } catch (error) {
     parsedStatus.textContent = "The inspector could not open this document.";
     pdfStatus.textContent = error.message;

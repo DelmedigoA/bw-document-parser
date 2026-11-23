@@ -7,7 +7,7 @@ Run once against the baseline package and once against the working tree:
     PYTHONPATH=/path/to/worktree/src python benchmarks/hosted_pipeline.py \
         --bundle /path/to/bundle --label new --workers 4 --batch-size 64
 
-Every ``openrouter.post`` call sleeps for ``--delay`` seconds and returns a
+Every replayed OpenRouter call sleeps for ``--delay`` seconds and returns a
 deterministic response, so elapsed time measures concurrency and request count
 rather than network or model speed. Each stage runs against a fresh copy of
 the bundle.
@@ -45,6 +45,17 @@ class Replay:
         self.requests = 0
         self.inputs = 0
         self.batch_sizes: list[int] = []
+        self.decisions = 0
+
+    def decide(self, payload: dict) -> dict:
+        if self.delay:
+            time.sleep(self.delay)
+        with self.lock:
+            self.decisions += 1
+        return {
+            "answers": {key: {"type": "noul", "noul": 1.0} for key in payload["questions"]},
+            "usage": {"cost": 0.000001},
+        }
 
     def post(self, endpoint: str, payload: dict) -> dict:
         if self.delay:
@@ -55,10 +66,12 @@ class Replay:
             with self.lock:
                 self.inputs += 1
             content = {
-                "decorative": False,
                 "description": "Replayed figure description",
                 "visible_text": None,
             }
+            properties = payload["response_format"]["json_schema"]["schema"]["properties"]
+            if "decorative" in properties:
+                content["decorative"] = False
             return {
                 "choices": [{
                     "finish_reason": "stop",
@@ -103,7 +116,11 @@ def _run(label: str, bundle: Path, replay: Replay, args) -> dict:
         replay.requests = replay.inputs = 0
         replay.batch_sizes = []
         started = time.perf_counter()
-        with patch.object(openrouter, "post", side_effect=replay.post):
+        replay.decisions = 0
+        with (
+            patch.object(openrouter, "post", side_effect=replay.post),
+            patch.object(openrouter, "decide", side_effect=replay.decide, create=True),
+        ):
             try:
                 enrichment.enrich_bundle(enriched, workers=args.workers)
             except TypeError:
@@ -111,6 +128,7 @@ def _run(label: str, bundle: Path, replay: Replay, args) -> dict:
         stages["enrichment"] = {
             "seconds": round(time.perf_counter() - started, 3),
             **replay.summary(),
+            "decisions": replay.decisions,
         }
 
         for mode in ("text", "multimodal"):
@@ -130,8 +148,16 @@ def _run(label: str, bundle: Path, replay: Replay, args) -> dict:
                 "seconds": round(time.perf_counter() - started, 3),
                 **replay.summary(),
             }
-            index = json.loads((copied / f"embeddings.{mode}.json").read_text())
-            stages[mode]["entries"] = len(index["entries"])
+            document = json.loads((copied / "document.json").read_text())
+            if document["schema_version"] == 4:
+                index = document["embedding_modes"][mode]
+                stages[mode]["entries"] = sum(
+                    entry["mode"] == mode for page in document["pages"]
+                    for piece in page["pieces"] for entry in piece["embeddings"]
+                )
+            else:
+                index = json.loads((copied / f"embeddings.{mode}.json").read_text())
+                stages[mode]["entries"] = len(index["entries"])
             stages[mode]["complete"] = index["complete"]
             stages[mode]["billed"] = index.get("billing", {}).get("total_cost")
     return {"label": label, "delay": args.delay, **stages}
