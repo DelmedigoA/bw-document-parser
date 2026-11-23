@@ -7,9 +7,9 @@ from tempfile import TemporaryDirectory
 from threading import Thread
 from unittest.mock import patch
 
-from bw_document_parser.inspector import _handler
-
 from test_rag_bundle import example_bundle
+
+from bw_document_parser.inspector import _handler
 
 
 class InspectorSearchTests(unittest.TestCase):

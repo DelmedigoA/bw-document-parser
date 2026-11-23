@@ -10,6 +10,7 @@ dependencies = [
     "docling-core==2.108.0",
     "filelock>=3",
     "pillow>=12",
+    "pypdfium2>=5.15,<6",
     "rapidocr==3.10.0",
     "tiktoken>=0.12,<1",
 ]

@@ -3,6 +3,7 @@
 import hashlib
 import json
 import re
+import threading
 from collections.abc import Iterator
 from io import BytesIO
 from pathlib import Path
@@ -15,12 +16,16 @@ from PIL import Image
 def read_json(path: Path) -> dict:
     data = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(data, dict):
-        raise ValueError(f"{path.name} must contain a JSON object")
+        # ValueError keeps the message usable through the CLI error handler.
+        raise ValueError(f"{path.name} must contain a JSON object")  # noqa: TRY004
     return data
 
 
 def write_json(path: Path, data: dict, *, indent: int | None = None) -> None:
-    stream = NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent, delete=False)
+    # The stream must stay open through json.dump before the atomic replace.
+    stream = NamedTemporaryFile(  # noqa: SIM115
+        mode="w", encoding="utf-8", dir=path.parent, delete=False
+    )
     temporary = Path(stream.name)
     try:
         with stream:
@@ -29,6 +34,26 @@ def write_json(path: Path, data: dict, *, indent: int | None = None) -> None:
         temporary.replace(path)
     finally:
         temporary.unlink(missing_ok=True)
+
+
+class JsonWriter:
+    """The only writer for one bundle file.
+
+    Hosted stages submit results from several worker threads but serialize
+    every snapshot through one lock. That keeps a partial run resumable
+    without letting two writers replace the same file at once.
+    """
+
+    def __init__(self, path: Path, *, indent: int | None = None) -> None:
+        self.path = path
+        self.indent = indent
+        self._lock = threading.Lock()
+        self.writes = 0
+
+    def write(self, data) -> None:
+        with self._lock:
+            write_json(self.path, data, indent=self.indent)
+            self.writes += 1
 
 
 def fingerprint(*values) -> str:
