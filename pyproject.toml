@@ -1,0 +1,26 @@
+[project]
+name = "bw-document-parser"
+version = "0.1.0"
+description = "Turn local PDFs into page-level text and image chunks for Bearing Witness."
+readme = "README.md"
+requires-python = ">=3.11,<3.15"
+dependencies = [
+    "beautifulsoup4>=4.14,<5",
+    "docling==2.152.0",
+    "docling-core==2.108.0",
+    "filelock>=3",
+    "pillow>=12",
+    "rapidocr==3.10.0",
+    "tiktoken>=0.12,<1",
+]
+
+[project.scripts]
+bw-document-parser = "bw_document_parser.cli:main"
+bw-document-inspector = "bw_document_parser.inspector:main"
+bw-document-enrich = "bw_document_parser.enrichment:main"
+bw-document-embed = "bw_document_parser.embeddings:main"
+bw-document-search = "bw_document_parser.embeddings:search_main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"

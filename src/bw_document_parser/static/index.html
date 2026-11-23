@@ -1,0 +1,75 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Parsing inspector</title>
+  <link rel="icon" href="data:,">
+  <link rel="stylesheet" href="/inspector.css">
+  <script type="module" src="/inspector.js"></script>
+</head>
+<body>
+  <header class="masthead">
+    <div class="app-title">
+      <span class="brand" aria-hidden="true">BW</span>
+      <h1>Parsing inspector</h1>
+    </div>
+    <span id="filename" class="filename"></span>
+  </header>
+  <main class="workspace">
+    <section class="pane parsed-pane" aria-labelledby="parsed-title">
+      <div class="toolbar">
+        <h2 id="parsed-title">Parsed page</h2>
+        <div class="mode-switch" role="group" aria-label="Parsed output format">
+          <button id="structure-mode" aria-pressed="false" type="button" hidden>Pieces</button>
+          <button id="html-mode" aria-pressed="true" type="button">HTML</button>
+          <button id="json-mode" aria-pressed="false" type="button">JSON</button>
+          <button id="search-mode" aria-pressed="false" type="button" hidden>Search</button>
+        </div>
+      </div>
+      <p id="parsed-status" class="pane-status" role="status">Loading parsed pages…</p>
+      <iframe id="parsed-html" title="Docling HTML for the current page" sandbox hidden></iframe>
+      <div id="parsed-preview" class="result-preview" hidden></div>
+      <pre id="parsed-json" class="result-json" tabindex="0" hidden></pre>
+      <section id="search-panel" class="search-panel" aria-label="Search document" hidden>
+        <form id="search-form">
+          <div class="search-query">
+            <input id="search-query" type="search" aria-label="Search query"
+                   placeholder="Describe a figure or enter a phrase" required maxlength="2000" dir="auto">
+            <button id="search-submit" type="submit">Search</button>
+          </div>
+          <div class="search-options">
+            <label><input type="checkbox" id="figures-only" checked> Figures only</label>
+            <label>Index <select id="search-index"></select></label>
+          </div>
+        </form>
+        <p id="search-status" role="status"></p>
+        <ol id="search-results" class="search-results"></ol>
+      </section>
+    </section>
+    <section class="pane pdf-pane" aria-labelledby="pdf-title">
+      <div class="toolbar">
+        <h2 id="pdf-title">Source PDF</h2>
+        <fieldset id="pdf-controls" class="pdf-controls" disabled aria-label="PDF controls">
+          <div class="navigation">
+            <button id="page-prev" type="button" aria-label="Previous page">‹</button>
+            <input id="page-number" type="number" min="1" value="1" aria-label="Page number">
+            <span id="page-count" class="page-count"></span>
+            <button id="page-next" type="button" aria-label="Next page">›</button>
+          </div>
+          <div class="zoom">
+            <button id="zoom-out" type="button" aria-label="Zoom out">−</button>
+            <button id="zoom-reset" type="button" aria-label="Reset zoom to fit width">100%</button>
+            <button id="zoom-in" type="button" aria-label="Zoom in">+</button>
+          </div>
+        </fieldset>
+      </div>
+      <p id="pdf-status" class="pane-status" role="status">Loading source PDF…</p>
+      <div id="pdf-scroll" class="pdf-scroll" tabindex="0" aria-label="PDF page">
+        <div id="pdf-page"></div>
+      </div>
+    </section>
+  </main>
+  <noscript>Enable JavaScript to inspect the PDF and parsed pages.</noscript>
+</body>
+</html>
