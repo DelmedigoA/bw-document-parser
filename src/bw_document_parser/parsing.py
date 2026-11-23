@@ -137,4 +137,3 @@ def parse_pdf(
         "page_count": total_pages,
         "strategies": {"parse": "docling-standard-v1"},
     }
-
