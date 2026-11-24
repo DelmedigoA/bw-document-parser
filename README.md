@@ -84,8 +84,8 @@ labeled block. Every figure gets a stable question ID derived from its source
 block ID, and answers are matched by that ID rather than by position. The
 single-figure state shape and question text are unchanged.
 
-A partial or invalid batch answer saves the valid decisions and retries only
-the missing figures as single requests. A batch the provider rejects with a
+A partial or invalid batch answer saves the valid decisions and the batch charge
+before retrying only the missing figures as single requests. A batch the provider rejects with a
 non-blocking error falls back to single requests. A quota error still stops the
 run after saving completed decisions. Each response’s actual OpenRouter charge,
 when reported, is recorded once in `document.json` under `decider_requests`; a figure’s share
@@ -113,7 +113,9 @@ Compare single-figure and batched Decider runs with
 The default report is a replay: it patches OpenRouter, so its timing measures
 request count and concurrency, not model latency. Pass `--live` with
 `OPENROUTER_API_KEY` to compare real decisions and charges. The report lists
-the request count, elapsed time, cost, and any decision that changed.
+the request count, elapsed time, cost, and any decision that changed. Both runs
+start from fresh enrichment state in temporary copies of the resolved bundle,
+including figures that were previously skipped.
 
 The default embedding mode is text, using `openai/text-embedding-3-small`.
 Pass `--mode multimodal` to use `nvidia/nemotron-3.5-embed-8b:free`. In that mode, targets store search text, 4,096-dimensional vectors, and source

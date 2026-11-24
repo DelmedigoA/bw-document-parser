@@ -2,8 +2,8 @@
 
 import hashlib
 import json
-import math
 import threading
+from collections import deque
 from collections.abc import Callable, Iterable
 from concurrent.futures import CancelledError, ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field, replace
@@ -75,6 +75,7 @@ class Outcome:
     actual_cost: float | None = None
     blocked: bool = False
     cancelled: bool = False
+    retries: list[tuple[FigureRequest, float | None]] = field(default_factory=list)
 
     def merge(self, other: "Outcome") -> None:
         self.decisions.update(other.decisions)
@@ -142,19 +143,19 @@ def _probability(answer: object) -> float | None:
     if not isinstance(answer, dict) or answer.get("type") != "noul":
         return None
     value = answer.get("noul")
-    if type(value) not in (int, float) or not math.isfinite(value) or not 0 <= value <= 1:
+    if type(value) not in (int, float) or not 0 <= value <= 1:
         return None
     return float(value)
 
 
-def _single_payload(request: FigureRequest, key: str | None = None) -> dict:
+def _single_payload(request: FigureRequest) -> dict:
     return {
         "model": MODEL,
         "state": [
             json.dumps(request.context, ensure_ascii=False),
             *(openrouter.image_part(data, mime) for data, mime in request.images),
         ],
-        "questions": {key or request.question_id: _QUESTION},
+        "questions": {request.question_id: _QUESTION},
     }
 
 
@@ -207,26 +208,21 @@ def _ledger_entry(
 
 
 def _execute(
-    requests: list[FigureRequest], *, stop: threading.Event | None, key: str | None = None,
+    requests: list[FigureRequest], *, stop: threading.Event | None,
+    prior_share: float | None = None,
 ) -> Outcome:
     if not requests:
         return Outcome()
     if stop is not None and stop.is_set():
         return Outcome(cancelled=True)
     batch = len(requests) > 1
-    payload = _batch_payload(requests) if batch else _single_payload(requests[0], key)
+    payload = _batch_payload(requests) if batch else _single_payload(requests[0])
     outcome = Outcome(requests=1)
     try:
         response = openrouter.decide(payload)
     except openrouter.OpenRouterError as exc:
         if batch and not exc.blocks_run:
-            # The provider explicitly rejected the batch shape. Retry each
-            # figure in the existing single-figure format.
-            for request in requests:
-                part = _execute([request], stop=stop)
-                outcome.merge(part)
-                if part.blocked or part.cancelled:
-                    break
+            outcome.retries.extend((request, None) for request in requests)
             return outcome
         outcome.errors.update((request.piece_id, exc) for request in requests)
         outcome.blocked = exc.blocks_run
@@ -240,50 +236,28 @@ def _execute(
     if not isinstance(answers, dict):
         answers = {}
     shares = _shares(cost, len(requests))
-    missing: list[FigureRequest] = []
     answered = 0
     for request, share in zip(requests, shares):
         probability = _probability(answers.get(request.question_id))
         if probability is None:
-            missing.append(request)
+            if batch:
+                outcome.retries.append((request, share))
+            else:
+                outcome.errors[request.piece_id] = openrouter.OpenRouterError(
+                    "Decider returned no usable probability for enrichment"
+                )
             continue
         answered += 1
         outcome.decisions[request.piece_id] = Decision(
             probability >= THRESHOLD,
             probability,
             request.fingerprint,
-            cost=share,
-            cost_allocation="estimated" if batch else "exact",
+            cost=_add_cost(share, prior_share),
+            cost_allocation="estimated" if batch or prior_share is not None else "exact",
         )
     entry = _ledger_entry(response, requests, "batch" if batch else "single", cost)
     entry["answered"] = answered
     outcome.ledger.append(entry)
-    if not missing:
-        return outcome
-    if not batch:
-        # A single request that returns no usable answer cannot be retried
-        # without sending the same request again.
-        outcome.errors[requests[0].piece_id] = openrouter.OpenRouterError(
-            "Decider returned no usable probability for enrichment"
-        )
-        return outcome
-
-    shares_by_piece = {request.piece_id: share for request, share in zip(requests, shares)}
-    for request in missing:
-        part = _execute([request], stop=stop)
-        decision = part.decisions.get(request.piece_id)
-        share = shares_by_piece[request.piece_id]
-        if decision is not None and share is not None:
-            # The rejected/partial batch still charged for this figure. Add
-            # its estimated share to the exact retry charge.
-            part.decisions[request.piece_id] = replace(
-                decision,
-                cost=_add_cost(share, decision.cost),
-                cost_allocation="estimated",
-            )
-        outcome.merge(part)
-        if part.blocked or part.cancelled:
-            break
     return outcome
 
 
@@ -299,21 +273,24 @@ def run_decisions(
     total = Outcome()
     if not requests:
         return total
-    if stop is not None and stop.is_set():
+    stop = stop if stop is not None else threading.Event()
+    if stop.is_set():
         total.cancelled = True
         return total
-    chunks = [
-        requests[index : index + batch_size]
+    queued: deque[tuple[list[FigureRequest], float | None]] = deque(
+        (requests[index : index + batch_size], None)
         for index in range(0, len(requests), batch_size)
-    ]
+    )
     with ThreadPoolExecutor(max_workers=workers) as pool:
-        futures = {
-            pool.submit(_execute, chunk, stop=stop): chunk for chunk in chunks
-        }
-        remaining = set(futures)
+        remaining = set()
         interrupted = None
-        while remaining:
+        while remaining or (queued and not stop.is_set()):
             try:
+                while queued and len(remaining) < workers and not stop.is_set():
+                    chunk, prior_share = queued.popleft()
+                    remaining.add(pool.submit(_execute, chunk, stop=stop, prior_share=prior_share))
+                if not remaining:
+                    break
                 future = next(as_completed(remaining))
                 remaining.remove(future)
                 try:
@@ -323,20 +300,22 @@ def run_decisions(
                 total.merge(outcome)
                 if on_outcome is not None:
                     on_outcome(outcome)
+                # The caller has saved this response and its valid decisions.
+                # Only now can the missing figures start paid retries.
+                queued.extendleft(([request], share) for request, share in reversed(outcome.retries))
                 if outcome.blocked:
-                    if stop is not None:
-                        stop.set()
-                    for pending in futures:
+                    stop.set()
+                    for pending in remaining:
                         pending.cancel()
             except (Exception, KeyboardInterrupt) as exc:  # noqa: BLE001 -- drain paid work before reraising
                 if interrupted is None:
                     interrupted = exc
-                if stop is not None:
-                    stop.set()
+                stop.set()
                 for pending in remaining:
                     pending.cancel()
         if interrupted is not None:
             raise interrupted
+    total.cancelled |= bool(queued)
     return total
 
 
@@ -344,11 +323,11 @@ def decide_figure(
     context: dict, images: list[tuple[bytes, str]], previous: dict | None = None,
 ) -> Decision:
     """Decide one figure. Kept for callers that do not need batching."""
-    request = prepare_request("", context, images)
+    request = replace(prepare_request("", context, images), question_id="enrich")
     cached = cached_decision(request, previous)
     if cached is not None:
         return cached
-    outcome = _execute([request], stop=None, key="enrich")
+    outcome = _execute([request], stop=None)
     decision = outcome.decisions.get("")
     if decision is not None:
         return decision

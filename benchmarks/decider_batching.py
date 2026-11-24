@@ -23,12 +23,16 @@ import math
 import os
 import shutil
 import sys
+import threading
 import time
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
-from bw_document_parser import enrichment, openrouter
+from bw_document_parser import enrichment, figure_decision, openrouter
+from bw_document_parser.bundle import read_document, write_json
+from bw_document_parser.document import apply_visual_decision
+from bw_document_parser.resolving import resolved_pieces
 
 INFORMATIVE = ("chart", "map", "diagram", "photo", "scan", "graph", "table")
 DECORATIVE = ("logo", "icon", "watermark", "decorative", "brand")
@@ -78,6 +82,7 @@ class Recorder:
         self.delay = delay
         self.live = live
         self._decide = decide
+        self._lock = threading.Lock()
         self.requests = 0
         self.inputs = 0
         self.batch_sizes: list[int] = []
@@ -85,21 +90,25 @@ class Recorder:
         self.unpriced = 0
 
     def decide(self, payload: dict) -> dict:
+        with self._lock:
+            self.requests += 1
+            request_number = self.requests
+            size = len(payload["questions"])
+            self.inputs += size
+            self.batch_sizes.append(size)
         if self.live:
             response = self._decide(payload)
         else:
             response = replay_decision(payload, self.delay)
             # The ledger treats a provider response ID as unique. Replays must
             # not reuse an ID or their charges collapse into one entry.
-            response["id"] = f"gen-replay-{self.requests + 1}"
-        self.requests += 1
-        self.inputs += len(payload["questions"])
-        self.batch_sizes.append(len(payload["questions"]))
+            response["id"] = f"gen-replay-{request_number}"
         cost = openrouter.cost_of(response)
-        if cost is None:
-            self.unpriced += 1
-        else:
-            self.cost += cost
+        with self._lock:
+            if cost is None:
+                self.unpriced += 1
+            else:
+                self.cost += cost
         return response
 
 
@@ -118,12 +127,32 @@ def replay_description(payload: dict, delay: float) -> dict:
     }
 
 
+def clear_enrichment(bundle: Path) -> None:
+    """Start each run with the same figures and an empty request ledger."""
+    document = read_document(bundle)
+    if document["schema_version"] != 4:
+        raise ValueError("The Decider benchmark needs a resolved bundle. Run bw-document-resolve first.")
+    document.pop("decider_requests", None)
+    for piece in resolved_pieces(document):
+        for source_id in piece["source_ids"]:
+            source = document["source_blocks"][source_id]
+            if source.get("excluded_visuals"):
+                apply_visual_decision(piece, source, {"enrich": True})
+            source.pop("enrichment_decision", None)
+            source.pop("enrichment", None)
+        for visual in piece["visual_part"] or ():
+            visual["description"] = None
+            visual["transcription"] = None
+    write_json(bundle / "document.json", document)
+
+
 def run(
     bundle: Path, *, batch_size: int, workers: int, delay: float, live: bool,
 ) -> dict:
     with TemporaryDirectory() as directory:
         copied = Path(directory) / "bundle"
         shutil.copytree(bundle, copied)
+        clear_enrichment(copied)
         recorder = Recorder(
             delay=0.0 if live else delay,
             live=live,
@@ -171,6 +200,8 @@ def run(
 
 
 def compare(bundle: Path, *, batch_size: int, workers: int, delay: float, live: bool) -> dict:
+    if not 1 <= batch_size <= figure_decision.MAX_BATCH_SIZE:
+        raise ValueError(f"batch size must be between 1 and {figure_decision.MAX_BATCH_SIZE}")
     single = run(bundle, batch_size=1, workers=workers, delay=delay, live=live)
     batched = run(bundle, batch_size=batch_size, workers=workers, delay=delay, live=live)
     pieces = sorted(set(single["decisions"]) | set(batched["decisions"]))
@@ -218,14 +249,16 @@ def main() -> int:
     args = parser.parse_args()
     if args.live and not os.getenv("OPENROUTER_API_KEY"):
         parser.error("--live needs OPENROUTER_API_KEY")
-    if args.batch_size < 1:
-        parser.error("--batch-size must be positive")
     if not math.isfinite(args.delay) or args.delay < 0:
         parser.error("--delay must be a non-negative number")
-    report = compare(
-        args.bundle, batch_size=args.batch_size, workers=args.workers,
-        delay=args.delay, live=args.live,
-    )
+    try:
+        with contextlib.redirect_stdout(sys.stderr):
+            report = compare(
+                args.bundle, batch_size=args.batch_size, workers=args.workers,
+                delay=args.delay, live=args.live,
+            )
+    except (ValueError, OSError) as exc:
+        parser.error(str(exc))
     payload = json.dumps(report, indent=2, ensure_ascii=False)
     if args.output:
         args.output.write_text(payload + "\n", encoding="utf-8")
@@ -238,6 +271,12 @@ def main() -> int:
             "review before enabling batching by default.",
             file=sys.stderr,
         )
+    if any(
+        not run["complete"] or not run["decider_requests"]
+        for run in (report["single"], report["batch"])
+    ):
+        print("Decider comparison incomplete. Check the request counts and errors.", file=sys.stderr)
+        return 1
     return 0
 
 

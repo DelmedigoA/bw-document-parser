@@ -10,6 +10,7 @@ from unittest.mock import patch
 
 from PIL import Image
 
+from benchmarks import decider_batching
 from bw_document_parser import figure_decision, openrouter
 from bw_document_parser.bundle import read_json, write_json
 from bw_document_parser.chunks import ImageFiles
@@ -213,6 +214,10 @@ class DeciderBatchingTests(unittest.TestCase):
                 return decision_response(
                     {identifiers["alpha"]: noul(0.9)}, cost=0.002, id="gen-batch",
                 )
+            checkpoint = read_json(bundle / "document.json")
+            self.assertEqual({"alpha": True}, decisions(checkpoint))
+            self.assertEqual("gen-batch", checkpoint["decider_requests"][0]["id"])
+            self.assertAlmostEqual(0.002, checkpoint["decider_requests"][0]["cost"])
             raise openrouter.OpenRouterError("quota", status=429)
 
         with (
@@ -410,6 +415,42 @@ class DeciderBatchingTests(unittest.TestCase):
         self.assertNotIn(
             "Answer only for Figure", payload["questions"][identifier]["instructions"],
         )
+
+    def test_single_figure_helper_reads_its_legacy_answer_key(self):
+        response = decision_response({"enrich": noul(0.9)}, cost=0.001)
+        with patch.object(openrouter, "decide", return_value=response) as decide:
+            decision = figure_decision.decide_figure({}, [])
+        self.assertEqual(["enrich"], list(decide.call_args.args[0]["questions"]))
+        self.assertTrue(decision.enrich)
+        self.assertEqual(0.001, decision.cost)
+
+    def test_benchmark_reruns_enriched_and_excluded_figures(self):
+        bundle = self.root / "bundle"
+        bundle.mkdir()
+        figure_bundle(bundle, [("alpha", "Chart", "red"), ("beta", "Logo", "blue")])
+        identifiers = qids("alpha", "beta")
+        response = decision_response({
+            identifiers["alpha"]: noul(0.9),
+            identifiers["beta"]: noul(0.1),
+        }, cost=0.02, id="gen-previous")
+        with (
+            patch.object(openrouter, "decide", return_value=response),
+            patch.object(openrouter, "post", return_value=description("Chart text")),
+        ):
+            self.assertTrue(enrich_bundle(bundle, workers=1, decider_batch_size=2))
+        original = (bundle / "document.json").read_bytes()
+
+        report = decider_batching.compare(bundle, batch_size=2, workers=2, delay=0, live=False)
+
+        for mode, requests in (("single", 2), ("batch", 1)):
+            run = report[mode]
+            self.assertTrue(run["complete"])
+            self.assertEqual(requests, run["decider_requests"])
+            self.assertEqual(requests, run["ledger_requests"])
+            self.assertAlmostEqual(run["decider_cost"], run["ledger_cost"])
+            self.assertEqual({"alpha": True, "beta": False}, run["decisions"])
+        self.assertEqual([], report["changed_decisions"])
+        self.assertEqual(original, (bundle / "document.json").read_bytes())
 
     def test_batch_size_is_configurable_and_validated(self):
         with patch.dict(os.environ, {"BW_DECIDER_BATCH_SIZE": "4"}):
