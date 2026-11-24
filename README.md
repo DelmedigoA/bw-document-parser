@@ -3,12 +3,19 @@
 Turn a PDF into structured document elements, ordered text chunks, and extracted figures.
 
 ```sh
-uv run bw-document-parser report.pdf --output-dir parsed-report
+doppler run --project bearingwitness --config dev_archiveai --only-secrets OPENROUTER_API_KEY -- \
+  uv run bw-document-parser report.pdf --output-dir parsed-report
 ```
 
 Use Python 3.11–3.14 and [uv](https://docs.astral.sh/uv/). Pick a new output
 directory. On the first run, Docling and tiktoken may download model files and
-tokenizer data. The PDF is processed locally. No API key is required.
+tokenizer data. Parsing requires `OPENROUTER_API_KEY` for the initial language
+check. The parser sends renders and any native text from the first three
+physical pages (or all pages of a shorter PDF) to Perplexity Decider V1.2 via
+OpenRouter. This sample comes from the start of the document even when
+`--page-range` selects later pages. A PDF proceeds to local Docling processing
+only if Decider classifies it as primarily English. Other PDFs are skipped with
+`NotImplementedError`.
 
 Walk through page 1 of the bundled example in
 [`examples/pdf_pipeline_piece_parts.ipynb`](examples/pdf_pipeline_piece_parts.ipynb).
