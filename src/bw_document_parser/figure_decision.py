@@ -11,7 +11,7 @@ from dataclasses import dataclass, field, replace
 from . import openrouter
 from .bundle import fingerprint
 
-MODEL = "perplexity/pplx-decider-v1.2"
+MODEL = openrouter.DECIDER_MODEL
 STRATEGY = "figure-enrichment-decision-v1"
 THRESHOLD = 0.5
 # Perplexity's Decisions adapter reads image parts only from the top-level
@@ -139,15 +139,6 @@ def _shares(cost: float | None, count: int) -> list[float | None]:
     return [cost / count] * count
 
 
-def _probability(answer: object) -> float | None:
-    if not isinstance(answer, dict) or answer.get("type") != "noul":
-        return None
-    value = answer.get("noul")
-    if type(value) not in (int, float) or not 0 <= value <= 1:
-        return None
-    return float(value)
-
-
 def _single_payload(request: FigureRequest) -> dict:
     return {
         "model": MODEL,
@@ -238,7 +229,7 @@ def _execute(
     shares = _shares(cost, len(requests))
     answered = 0
     for request, share in zip(requests, shares):
-        probability = _probability(answers.get(request.question_id))
+        probability = openrouter.decision_probability(answers.get(request.question_id))
         if probability is None:
             if batch:
                 outcome.retries.append((request, share))

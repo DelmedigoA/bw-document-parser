@@ -1,4 +1,4 @@
-"""OpenRouter transport for the opt-in hosted commands."""
+"""OpenRouter transport for hosted processing."""
 
 import base64
 import json
@@ -12,6 +12,7 @@ from urllib.request import Request, urlopen
 
 _URL = "https://openrouter.ai/api/v1"
 _RETRYABLE = {408, 425, 429, 500, 502, 503, 504, 529}
+DECIDER_MODEL = "perplexity/pplx-decider-v1.2"
 
 
 class OpenRouterError(ValueError):
@@ -62,6 +63,15 @@ def post(endpoint: str, payload: dict) -> dict:
 
 def decide(payload: dict) -> dict:
     return _post("https://openrouter.ai/api/alpha/decisions", payload)
+
+
+def decision_probability(answer: object) -> float | None:
+    if not isinstance(answer, dict) or answer.get("type") != "noul":
+        return None
+    value = answer.get("noul")
+    if type(value) not in (int, float) or not 0 <= value <= 1:
+        return None
+    return float(value)
 
 
 def _post(url: str, payload: dict) -> dict:

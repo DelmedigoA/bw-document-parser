@@ -1,39 +1,38 @@
 """Docling extraction strategy and source assets."""
 
 import hashlib
+from contextlib import closing
 from dataclasses import asdict
 from pathlib import Path
 
+import pypdfium2
+
 from .chunks import ImageFiles
 from .document import Document, ParsedDoc, Parser
+from .language_decision import _prepare_for_decider, is_english
 
 DEFAULT_PAGE_BATCH_SIZE = 12
-
-
-def _page_count(pdf: Path) -> int:
-    import pypdfium2
-
-    document = pypdfium2.PdfDocument(str(pdf))
-    try:
-        return len(document)
-    finally:
-        document.close()
 
 
 def parse_pdf(
     pdf: Path, bundle: Path, *, page_range: tuple[int, int] | None = None,
     page_batch_size: int = DEFAULT_PAGE_BATCH_SIZE,
 ) -> ParsedDoc:
-    """Extract an inclusive range of physical pages with the existing Docling strategy."""
+    """Check for English, then extract an inclusive range of pages with Docling."""
     pdf, bundle = Path(pdf), Path(bundle)
     if not pdf.is_file() or pdf.suffix.lower() != ".pdf":
         raise ValueError("input must be a local PDF file")
     if page_batch_size < 1:
         raise ValueError("page batch size must be positive")
-    total_pages = _page_count(pdf)
-    first, last = page_range if page_range is not None else (1, total_pages)
-    if not 1 <= first <= last <= total_pages:
-        raise ValueError(f"page range must be within 1–{total_pages}")
+    with closing(pypdfium2.PdfDocument(str(pdf))) as document:
+        total_pages = len(document)
+        first, last = page_range if page_range is not None else (1, total_pages)
+        if not 1 <= first <= last <= total_pages:
+            raise ValueError(f"page range must be within 1–{total_pages}")
+        sample = _prepare_for_decider(document)
+    if not is_english(sample):
+        raise NotImplementedError("PDF parsing currently supports English documents only")
+
     images = ImageFiles(bundle / "images")
 
     from docling.datamodel.base_models import ConversionStatus, InputFormat

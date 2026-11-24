@@ -37,7 +37,7 @@ def _write_bundle(
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Extract PDF pages into text pieces and images."
+        description="Check for English with Perplexity Decider, then extract PDF text and images."
     )
     parser.add_argument("pdf", type=Path, help="local PDF to parse")
     parser.add_argument(
