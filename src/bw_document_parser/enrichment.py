@@ -13,7 +13,7 @@ from pathlib import Path
 
 from filelock import Timeout
 
-from . import openrouter
+from . import figure_decision, openrouter
 from .bundle import (
     JsonWriter,
     api_image,
@@ -25,7 +25,7 @@ from .bundle import (
     read_document,
     read_image,
 )
-from .concurrency import resolve_workers
+from .concurrency import resolve_batch_size, resolve_workers
 from .document import (
     EnrichedDoc,
     FigureEnrichment,
@@ -35,7 +35,7 @@ from .document import (
     upgrade_resolved,
 )
 from .figure_decision import STRATEGY as DECISION_STRATEGY
-from .figure_decision import Decision, decide_figure
+from .figure_decision import Decision
 from .prompts import FIGURE_DESCRIPTION, FIGURE_DESCRIPTION_VERSION
 from .resolving import block_document, resolved_pieces
 
@@ -125,7 +125,7 @@ def describe(
 class _Job:
     piece: dict
     context: dict
-    image_data: list[bytes]
+    images: list[tuple[bytes, str]]
     identity: str
 
 
@@ -134,16 +134,21 @@ class _Result:
     job: _Job | None
     description: Description | None = None
     error: Exception | None = None
-    decision: Decision | None = None
 
 
 def enrich_document(
     resolved: ResolvedDoc, bundle: Path, *, block_ids: Collection[str] | None = None,
-    workers: int | None = None, save: Callable[[EnrichedDoc], None] | None = None,
+    workers: int | None = None, decider_batch_size: int | None = None,
+    save: Callable[[EnrichedDoc], None] | None = None,
 ) -> tuple[EnrichedDoc, bool]:
     """Enrich selected figures in a new snapshot, optionally saving progress."""
     document = upgrade_resolved(deepcopy(resolved))
     workers = resolve_workers(workers, "BW_ENRICH_WORKERS")
+    decide_batch_size = resolve_batch_size(
+        decider_batch_size, "BW_DECIDER_BATCH_SIZE",
+        default=figure_decision.DEFAULT_BATCH_SIZE,
+        maximum=figure_decision.MAX_BATCH_SIZE,
+    )
     selected = set(block_ids) if block_ids is not None else None
     owners = {}
     routed = document["schema_version"] == 4
@@ -162,6 +167,7 @@ def enrich_document(
             continue
         try:
             raw = [read_image(bundle, path) for path in paths]
+            images = [api_image(data, 2048) for data in raw]
             context = {
                 "section": " / ".join(headings)[-2000:],
                 "published_caption": "\n".join(linked_text(piece, by_id, "caption_ids"))[:4000],
@@ -174,35 +180,113 @@ def enrich_document(
             if previous.get("fingerprint") == identity and previous.get("description"):
                 reused += 1
                 continue
-            jobs.append(_Job(piece, context, raw, identity))
+            jobs.append(_Job(piece, context, images, identity))
         except (OSError, ValueError) as exc:
             print(f"{piece['id']}: {exc}", file=sys.stderr)
             failed += 1
 
     stop = threading.Event()
+    decided: dict[str, Decision] = {}
+    requests: list[figure_decision.FigureRequest] = []
+    if routed:
+        for job in jobs:
+            request = figure_decision.prepare_request(
+                job.piece["id"], job.context, job.images
+            )
+            cached = figure_decision.cached_decision(
+                request, job.piece.get("enrichment_decision")
+            )
+            if cached is None:
+                requests.append(request)
+            else:
+                decided[job.piece["id"]] = cached
+
+    decision_requests = decision_batches = decision_singles = 0
+    decision_unanswered = decision_unpriced = 0
+    decision_cost: float | None = None
+    ledger = document.setdefault("decider_requests", []) if routed else None
+    ledger_ids = {
+        entry.get("id") for entry in ledger or () if isinstance(entry, dict) and entry.get("id")
+    }
+
+    def record_decisions(outcome: figure_decision.Outcome) -> None:
+        nonlocal failed, decision_requests, decision_batches, decision_singles
+        nonlocal decision_unanswered, decision_unpriced, decision_cost
+        decision_requests += outcome.requests
+        decision_unanswered += max(0, outcome.requests - len(outcome.ledger))
+        decision_batches += sum(entry["kind"] == "batch" for entry in outcome.ledger)
+        decision_singles += sum(entry["kind"] == "single" for entry in outcome.ledger)
+        decision_unpriced += sum(entry.get("cost") is None for entry in outcome.ledger)
+        if outcome.actual_cost is not None:
+            decision_cost = (
+                outcome.actual_cost
+                if decision_cost is None
+                else decision_cost + outcome.actual_cost
+            )
+        changed = False
+        if outcome.ledger and ledger is not None:
+            for entry in outcome.ledger:
+                identity = entry.get("id")
+                if identity and identity in ledger_ids:
+                    continue
+                ledger.append(entry)
+                if identity:
+                    ledger_ids.add(identity)
+                changed = True
+        for piece_id, decision in outcome.decisions.items():
+            decided[piece_id] = decision
+            owner = owners.get(piece_id)
+            if owner is None:
+                continue
+            source = document["source_blocks"][piece_id]
+            record = asdict(decision)
+            if source.get("enrichment_decision") == record:
+                continue
+            apply_visual_decision(owner, source, record)
+            changed = True
+        if changed and save is not None:
+            # Persist the whole completed batch, including its one actual
+            # charge, before waiting for the next batch.
+            save(document)
+        for piece_id, exc in outcome.errors.items():
+            print(f"{piece_id}: {exc}", file=sys.stderr)
+            failed += 1
+            if isinstance(exc, openrouter.OpenRouterError) and exc.blocks_run:
+                stop.set()
+
+    if requests:
+        figure_decision.run_decisions(
+            requests, batch_size=decide_batch_size, workers=workers,
+            stop=stop, on_outcome=record_decisions,
+        )
+
+    if routed:
+        skipped = sum(
+            1 for job in jobs
+            if (decision := decided.get(job.piece["id"])) is not None
+            and not decision.enrich
+        )
+        approved = [
+            job for job in jobs
+            if (decision := decided.get(job.piece["id"])) is not None and decision.enrich
+        ]
+    else:
+        approved = jobs
 
     def run(job: _Job) -> _Result:
         if stop.is_set():
             return _Result(None)
-        decision = None
         try:
-            images = [api_image(data, 2048) for data in job.image_data]
-            if routed:
-                decision = decide_figure(
-                    job.context, images, job.piece.get("enrichment_decision")
-                )
-                if not decision.enrich or stop.is_set():
-                    return _Result(job, decision=decision)
-            description = _description(job.context, images)
+            description = _description(job.context, job.images)
         except (OSError, ValueError) as exc:
             if isinstance(exc, openrouter.OpenRouterError) and exc.blocks_run:
                 stop.set()
-            return _Result(job, error=exc, decision=decision)
-        return _Result(job, description=description, decision=decision)
+            return _Result(job, error=exc)
+        return _Result(job, description=description)
 
-    if jobs:
+    if approved and not stop.is_set():
         with ThreadPoolExecutor(max_workers=workers) as pool:
-            futures = {pool.submit(run, job): job for job in jobs}
+            futures = {pool.submit(run, job): job for job in approved}
             remaining = set(futures)
             interrupted = None
             while remaining:
@@ -216,15 +300,6 @@ def enrich_document(
                     job = result.job
                     if job is None:
                         continue
-                    decision = result.decision
-                    owner = owners.get(job.piece["id"])
-                    if decision is not None and owner is not None:
-                        source = document["source_blocks"][job.piece["id"]]
-                        record = asdict(decision)
-                        changed = source.get("enrichment_decision") != record
-                        apply_visual_decision(owner, source, record)
-                        if changed and save is not None:
-                            save(document)
                     if result.error is not None:
                         print(f"{job.piece['id']}: {result.error}", file=sys.stderr)
                         failed += 1
@@ -238,7 +313,6 @@ def enrich_document(
                         continue
                     description = result.description
                     if description is None:
-                        skipped += int(decision is not None and not decision.enrich)
                         continue
                     job.piece["enrichment"] = asdict(FigureEnrichment(
                         description.description,
@@ -249,6 +323,7 @@ def enrich_document(
                         asset_paths(job.piece),
                         cost=description.cost,
                     ))
+                    owner = owners.get(job.piece["id"])
                     if owner is not None:
                         set_visual_enrichment(
                             owner["visual_part"] or [], document["source_blocks"],
@@ -268,22 +343,46 @@ def enrich_document(
             if interrupted is not None:
                 raise interrupted
 
+    suffix = f"(workers: {workers}"
+    if routed:
+        if not decision_requests:
+            cost = "none"
+        elif decision_cost is None:
+            cost = "unavailable"
+        elif decision_unpriced:
+            cost = f"${decision_cost:.6f} + {decision_unpriced} unpriced"
+        else:
+            cost = f"${decision_cost:.6f}"
+        breakdown = f"{decision_batches} batch, {decision_singles} single"
+        if decision_unanswered:
+            breakdown += f", {decision_unanswered} no response"
+        suffix += (
+            f", decider batch: {decide_batch_size}"
+            f", decider requests: {decision_requests} ({breakdown})"
+            f", decider cost: {cost}"
+        )
+    suffix += ")"
     print(
         f"Figures enriched: {enriched}, skipped by Decider: {skipped}, reused: {reused}, "
-        f"no image: {missing}, failed: {failed} "
-        f"(workers: {workers})"
+        f"no image: {missing}, failed: {failed} {suffix}"
     )
     if save is not None:
         save(document)
     return document, failed == 0
 
 
-
-def enrich_bundle(bundle: Path, *, workers: int | None = None) -> bool:
+def enrich_bundle(
+    bundle: Path, *, workers: int | None = None,
+    decider_batch_size: int | None = None,
+) -> bool:
     with document_lock(bundle):
         writer = JsonWriter(bundle / "document.json")
-        _, complete = enrich_document(read_document(bundle), bundle, workers=workers, save=writer.write)
+        _, complete = enrich_document(
+            read_document(bundle), bundle, workers=workers,
+            decider_batch_size=decider_batch_size, save=writer.write,
+        )
         return complete
+
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
@@ -294,10 +393,26 @@ def main() -> int:
         default=None,
         help="concurrent Hy4 Flash requests (default: 4, env BW_ENRICH_WORKERS)",
     )
+    parser.add_argument(
+        "--decider-batch-size",
+        type=int,
+        default=None,
+        help=(
+            "figures per Perplexity Decider request (default: 1, env "
+            "BW_DECIDER_BATCH_SIZE; opt in above 1)"
+        ),
+    )
     args = parser.parse_args()
     try:
         workers = resolve_workers(args.workers, "BW_ENRICH_WORKERS")
-        return 0 if enrich_bundle(args.bundle, workers=workers) else 1
+        batch_size = resolve_batch_size(
+            args.decider_batch_size, "BW_DECIDER_BATCH_SIZE",
+            default=figure_decision.DEFAULT_BATCH_SIZE,
+            maximum=figure_decision.MAX_BATCH_SIZE,
+        )
+        return 0 if enrich_bundle(
+            args.bundle, workers=workers, decider_batch_size=batch_size,
+        ) else 1
     except (OSError, ValueError, Timeout) as exc:
         print(f"{parser.prog}: {exc}", file=sys.stderr)
         return 1

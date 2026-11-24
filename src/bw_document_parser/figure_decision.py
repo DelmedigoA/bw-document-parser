@@ -2,7 +2,11 @@
 
 import hashlib
 import json
-from dataclasses import dataclass
+import math
+import threading
+from collections.abc import Callable, Iterable
+from concurrent.futures import CancelledError, ThreadPoolExecutor, as_completed
+from dataclasses import dataclass, field, replace
 
 from . import openrouter
 from .bundle import fingerprint
@@ -10,6 +14,13 @@ from .bundle import fingerprint
 MODEL = "perplexity/pplx-decider-v1.2"
 STRATEGY = "figure-enrichment-decision-v1"
 THRESHOLD = 0.5
+# Perplexity's Decisions adapter reads image parts only from the top-level
+# state array; it rejects images inside a question. A batched request can
+# therefore label each figure's context and images in state, but the model,
+# not the API, must keep the segments apart. Keep batching opt-in until a
+# live comparison shows that the labels are followed reliably.
+DEFAULT_BATCH_SIZE = 1
+MAX_BATCH_SIZE = 8
 _QUESTION = {
     "type": "noul",
     "instructions": (
@@ -41,30 +52,307 @@ class Decision:
     strategy: str = STRATEGY
     threshold: float = THRESHOLD
     cost: float | None = None
+    # A single request reports this figure's charge exactly. A batch reports
+    # one charge for the whole request, so each figure's share is an estimate.
+    cost_allocation: str = "exact"
+
+
+@dataclass(frozen=True)
+class FigureRequest:
+    piece_id: str
+    question_id: str
+    context: dict
+    images: tuple[tuple[bytes, str], ...]
+    fingerprint: str
+
+
+@dataclass
+class Outcome:
+    decisions: dict[str, Decision] = field(default_factory=dict)
+    errors: dict[str, Exception] = field(default_factory=dict)
+    ledger: list[dict] = field(default_factory=list)
+    requests: int = 0
+    actual_cost: float | None = None
+    blocked: bool = False
+    cancelled: bool = False
+
+    def merge(self, other: "Outcome") -> None:
+        self.decisions.update(other.decisions)
+        self.errors.update(other.errors)
+        self.ledger.extend(other.ledger)
+        self.requests += other.requests
+        self.actual_cost = _add_cost(self.actual_cost, other.actual_cost)
+        self.blocked = self.blocked or other.blocked
+        self.cancelled = self.cancelled or other.cancelled
+
+
+def question_id(piece_id: str) -> str:
+    """Return a stable, provider-safe key for a figure's question."""
+    return "q_" + hashlib.sha256(piece_id.encode("utf-8")).hexdigest()[:24]
+
+
+def decision_fingerprint(context: dict, images: Iterable[tuple[bytes, str]]) -> str:
+    return fingerprint(
+        MODEL, STRATEGY, THRESHOLD, _QUESTION, context,
+        [(mime, hashlib.sha256(data).hexdigest()) for data, mime in images],
+    )
+
+
+def prepare_request(
+    piece_id: str, context: dict, images: Iterable[tuple[bytes, str]],
+) -> FigureRequest:
+    images = tuple(images)
+    return FigureRequest(
+        piece_id, question_id(piece_id), context, images,
+        decision_fingerprint(context, images),
+    )
+
+
+def cached_decision(
+    request: FigureRequest, previous: dict | None,
+) -> Decision | None:
+    """Reuse a decision for identical inputs, including decisions from singles."""
+    if not previous or previous.get("fingerprint") != request.fingerprint:
+        return None
+    try:
+        return Decision(**previous)
+    except TypeError:
+        # An older record with unexpected fields is safer to recompute than to
+        # reuse with a shape this version does not understand.
+        return None
+
+
+def _add_cost(left: float | None, right: float | None) -> float | None:
+    if left is None:
+        return right
+    if right is None:
+        return left
+    return left + right
+
+
+def _shares(cost: float | None, count: int) -> list[float | None]:
+    if cost is None:
+        return [None] * count
+    if count == 1:
+        return [cost]
+    return [cost / count] * count
+
+
+def _probability(answer: object) -> float | None:
+    if not isinstance(answer, dict) or answer.get("type") != "noul":
+        return None
+    value = answer.get("noul")
+    if type(value) not in (int, float) or not math.isfinite(value) or not 0 <= value <= 1:
+        return None
+    return float(value)
+
+
+def _single_payload(request: FigureRequest, key: str | None = None) -> dict:
+    return {
+        "model": MODEL,
+        "state": [
+            json.dumps(request.context, ensure_ascii=False),
+            *(openrouter.image_part(data, mime) for data, mime in request.images),
+        ],
+        "questions": {key or request.question_id: _QUESTION},
+    }
+
+
+def _batch_payload(requests: list[FigureRequest]) -> dict:
+    """Label each figure's context and images in the shared state array.
+
+    Image parts cannot sit in a question for Perplexity, so a question can
+    address its figure only through the label written immediately before that
+    figure's context and images.
+    """
+    state: list = []
+    questions: dict[str, dict] = {}
+    total = len(requests)
+    for position, request in enumerate(requests, 1):
+        state.append(
+            f"Figure {position} of {total}. Question ID: {request.question_id}. "
+            f"Context: {json.dumps(request.context, ensure_ascii=False)}"
+        )
+        state.extend(
+            openrouter.image_part(data, mime) for data, mime in request.images
+        )
+        questions[request.question_id] = {
+            **_QUESTION,
+            "instructions": (
+                f"{_QUESTION['instructions']} Answer only for Figure {position} of "
+                f"{total} (question ID {request.question_id}), using only the "
+                "context text directly before that figure's images and those "
+                "images. Ignore the other figures."
+            ),
+        }
+    return {"model": MODEL, "state": state, "questions": questions}
+
+
+def _ledger_entry(
+    response: dict, requests: list[FigureRequest], kind: str, cost: float | None,
+) -> dict:
+    entry = {
+        "kind": kind,
+        "model": response.get("model") if isinstance(response.get("model"), str) else MODEL,
+        "provider": response.get("provider"),
+        "question_ids": [request.question_id for request in requests],
+        "pieces": [request.piece_id for request in requests],
+        "requested": len(requests),
+        "answered": 0,
+        "cost": cost,
+    }
+    if isinstance(response.get("id"), str):
+        entry["id"] = response["id"]
+    return entry
+
+
+def _execute(
+    requests: list[FigureRequest], *, stop: threading.Event | None, key: str | None = None,
+) -> Outcome:
+    if not requests:
+        return Outcome()
+    if stop is not None and stop.is_set():
+        return Outcome(cancelled=True)
+    batch = len(requests) > 1
+    payload = _batch_payload(requests) if batch else _single_payload(requests[0], key)
+    outcome = Outcome(requests=1)
+    try:
+        response = openrouter.decide(payload)
+    except openrouter.OpenRouterError as exc:
+        if batch and not exc.blocks_run:
+            # The provider explicitly rejected the batch shape. Retry each
+            # figure in the existing single-figure format.
+            for request in requests:
+                part = _execute([request], stop=stop)
+                outcome.merge(part)
+                if part.blocked or part.cancelled:
+                    break
+            return outcome
+        outcome.errors.update((request.piece_id, exc) for request in requests)
+        outcome.blocked = exc.blocks_run
+        if outcome.blocked and stop is not None:
+            stop.set()
+        return outcome
+
+    cost = openrouter.cost_of(response)
+    outcome.actual_cost = cost
+    answers = response.get("answers")
+    if not isinstance(answers, dict):
+        answers = {}
+    shares = _shares(cost, len(requests))
+    missing: list[FigureRequest] = []
+    answered = 0
+    for request, share in zip(requests, shares):
+        probability = _probability(answers.get(request.question_id))
+        if probability is None:
+            missing.append(request)
+            continue
+        answered += 1
+        outcome.decisions[request.piece_id] = Decision(
+            probability >= THRESHOLD,
+            probability,
+            request.fingerprint,
+            cost=share,
+            cost_allocation="estimated" if batch else "exact",
+        )
+    entry = _ledger_entry(response, requests, "batch" if batch else "single", cost)
+    entry["answered"] = answered
+    outcome.ledger.append(entry)
+    if not missing:
+        return outcome
+    if not batch:
+        # A single request that returns no usable answer cannot be retried
+        # without sending the same request again.
+        outcome.errors[requests[0].piece_id] = openrouter.OpenRouterError(
+            "Decider returned no usable probability for enrichment"
+        )
+        return outcome
+
+    shares_by_piece = {request.piece_id: share for request, share in zip(requests, shares)}
+    for request in missing:
+        part = _execute([request], stop=stop)
+        decision = part.decisions.get(request.piece_id)
+        share = shares_by_piece[request.piece_id]
+        if decision is not None and share is not None:
+            # The rejected/partial batch still charged for this figure. Add
+            # its estimated share to the exact retry charge.
+            part.decisions[request.piece_id] = replace(
+                decision,
+                cost=_add_cost(share, decision.cost),
+                cost_allocation="estimated",
+            )
+        outcome.merge(part)
+        if part.blocked or part.cancelled:
+            break
+    return outcome
+
+
+def run_decisions(
+    requests: Iterable[FigureRequest], *, batch_size: int, workers: int,
+    stop: threading.Event | None = None,
+    on_outcome: Callable[[Outcome], None] | None = None,
+) -> Outcome:
+    """Run decider requests in batches with bounded in-flight requests."""
+    if not 1 <= batch_size <= MAX_BATCH_SIZE:
+        raise ValueError(f"decider batch size must be between 1 and {MAX_BATCH_SIZE}")
+    requests = list(requests)
+    total = Outcome()
+    if not requests:
+        return total
+    if stop is not None and stop.is_set():
+        total.cancelled = True
+        return total
+    chunks = [
+        requests[index : index + batch_size]
+        for index in range(0, len(requests), batch_size)
+    ]
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = {
+            pool.submit(_execute, chunk, stop=stop): chunk for chunk in chunks
+        }
+        remaining = set(futures)
+        interrupted = None
+        while remaining:
+            try:
+                future = next(as_completed(remaining))
+                remaining.remove(future)
+                try:
+                    outcome = future.result()
+                except CancelledError:
+                    continue
+                total.merge(outcome)
+                if on_outcome is not None:
+                    on_outcome(outcome)
+                if outcome.blocked:
+                    if stop is not None:
+                        stop.set()
+                    for pending in futures:
+                        pending.cancel()
+            except (Exception, KeyboardInterrupt) as exc:  # noqa: BLE001 -- drain paid work before reraising
+                if interrupted is None:
+                    interrupted = exc
+                if stop is not None:
+                    stop.set()
+                for pending in remaining:
+                    pending.cancel()
+        if interrupted is not None:
+            raise interrupted
+    return total
 
 
 def decide_figure(
     context: dict, images: list[tuple[bytes, str]], previous: dict | None = None,
 ) -> Decision:
-    identity = fingerprint(
-        MODEL, STRATEGY, THRESHOLD, _QUESTION, context,
-        [(mime, hashlib.sha256(data).hexdigest()) for data, mime in images],
-    )
-    if previous and previous.get("fingerprint") == identity:
-        return Decision(**previous)
-    response = openrouter.decide({
-        "model": MODEL,
-        "state": [
-            json.dumps(context, ensure_ascii=False),
-            *(openrouter.image_part(data, mime) for data, mime in images),
-        ],
-        "questions": {"enrich": _QUESTION},
-    })
-    try:
-        answer = response["answers"]["enrich"]
-        probability = answer["noul"]
-        if answer["type"] != "noul" or type(probability) not in (int, float) or not 0 <= probability <= 1:
-            raise ValueError
-    except (KeyError, TypeError, ValueError):
-        raise openrouter.OpenRouterError("Decider returned no usable probability for enrichment") from None
-    return Decision(probability >= THRESHOLD, probability, identity, cost=openrouter.cost_of(response))
+    """Decide one figure. Kept for callers that do not need batching."""
+    request = prepare_request("", context, images)
+    cached = cached_decision(request, previous)
+    if cached is not None:
+        return cached
+    outcome = _execute([request], stop=None, key="enrich")
+    decision = outcome.decisions.get("")
+    if decision is not None:
+        return decision
+    error = next(iter(outcome.errors.values()), None)
+    if error is not None:
+        raise error
+    raise openrouter.OpenRouterError("Decider returned no usable probability for enrichment")

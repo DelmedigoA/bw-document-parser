@@ -75,6 +75,24 @@ piece’s visual part and stays with its source block for provenance. The
 decision is saved and reused when the image and context match. An API error leaves the figure
 available for retry.
 
+Decider batching is opt-in and off by default. `--decider-batch-size` (or
+`BW_DECIDER_BATCH_SIZE`) sends up to 8 figures in one request. Perplexity’s
+Decisions adapter reads images only from the top-level `state` array and
+rejects an image placed inside a question, so a batch writes a labeled context
+block before each figure’s images and asks each question to use only its own
+labeled block. Every figure gets a stable question ID derived from its source
+block ID, and answers are matched by that ID rather than by position. The
+single-figure state shape and question text are unchanged.
+
+A partial or invalid batch answer saves the valid decisions and retries only
+the missing figures as single requests. A batch the provider rejects with a
+non-blocking error falls back to single requests. A quota error still stops the
+run after saving completed decisions. Each response’s actual OpenRouter charge,
+when reported, is recorded once in `document.json` under `decider_requests`; a figure’s share
+of a batch is stored on its decision with `cost_allocation: "estimated"`, while
+a single-request cost is `"exact"`. Keep the default of 1 until a live
+comparison confirms that Perplexity follows the per-figure labels.
+
 Model prompts and their versions live in `src/bw_document_parser/prompts/`.
 When changing a prompt, bump its version in that directory so the next
 enrichment run can detect previously saved results that need refreshing.
@@ -89,6 +107,13 @@ Enrichment sends independent figures concurrently. The default is 4 requests
 at once; set `--workers` or `BW_ENRICH_WORKERS` to change it. Each completed
 figure is saved immediately, so a quota failure or interrupt keeps the paid
 results and a rerun only requests the missing figures.
+
+Compare single-figure and batched Decider runs with
+`python benchmarks/decider_batching.py --bundle parsed-report --batch-size 8`.
+The default report is a replay: it patches OpenRouter, so its timing measures
+request count and concurrency, not model latency. Pass `--live` with
+`OPENROUTER_API_KEY` to compare real decisions and charges. The report lists
+the request count, elapsed time, cost, and any decision that changed.
 
 The default embedding mode is text, using `openai/text-embedding-3-small`.
 Pass `--mode multimodal` to use `nvidia/nemotron-3.5-embed-8b:free`. In that mode, targets store search text, 4,096-dimensional vectors, and source
