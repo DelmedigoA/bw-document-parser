@@ -5,12 +5,14 @@ Run once against the baseline package and once against the working tree:
     PYTHONPATH=/path/to/baseline/src python benchmarks/hosted_pipeline.py \
         --bundle /path/to/bundle --label baseline
     PYTHONPATH=/path/to/worktree/src python benchmarks/hosted_pipeline.py \
-        --bundle /path/to/bundle --label new --workers 4 --batch-size 64
+        --bundle /path/to/bundle --label new --workers 4 --batch-size 64 \
+        --decider-batch-size 8
 
 Every replayed OpenRouter call sleeps for ``--delay`` seconds and returns a
 deterministic response, so elapsed time measures concurrency and request count
-rather than network or model speed. Each stage runs against a fresh copy of
-the bundle.
+rather than network or model speed. The Decider cost is a synthetic per-figure
+amount, not a provider quote. Each stage runs against a fresh copy of the
+bundle.
 """
 
 import argparse
@@ -46,15 +48,23 @@ class Replay:
         self.inputs = 0
         self.batch_sizes: list[int] = []
         self.decisions = 0
+        self.decision_inputs = 0
+        self.decision_batch_sizes: list[int] = []
+        self.decision_cost = 0.0
 
     def decide(self, payload: dict) -> dict:
         if self.delay:
             time.sleep(self.delay)
+        questions = payload["questions"]
+        cost = 0.000001 * max(1, len(questions))
         with self.lock:
             self.decisions += 1
+            self.decision_inputs += len(questions)
+            self.decision_batch_sizes.append(len(questions))
+            self.decision_cost += cost
         return {
-            "answers": {key: {"type": "noul", "noul": 1.0} for key in payload["questions"]},
-            "usage": {"cost": 0.000001},
+            "answers": {key: {"type": "noul", "noul": 1.0} for key in questions},
+            "usage": {"cost": cost},
         }
 
     def post(self, endpoint: str, payload: dict) -> dict:
@@ -101,6 +111,20 @@ class Replay:
             "largest_batch": max(self.batch_sizes, default=0),
         }
 
+    def decision_summary(self) -> dict:
+        return {
+            "decider_requests": self.decisions,
+            "decider_inputs": self.decision_inputs,
+            "largest_decider_batch": max(self.decision_batch_sizes, default=0),
+            "decider_cost": self.decision_cost,
+        }
+
+    def reset_decisions(self) -> None:
+        self.decisions = 0
+        self.decision_inputs = 0
+        self.decision_batch_sizes = []
+        self.decision_cost = 0.0
+
 
 def _copy_bundle(source: Path, root: Path) -> Path:
     target = root / source.name
@@ -115,20 +139,26 @@ def _run(label: str, bundle: Path, replay: Replay, args) -> dict:
         enriched = _copy_bundle(bundle, root / "enrich")
         replay.requests = replay.inputs = 0
         replay.batch_sizes = []
+        replay.reset_decisions()
         started = time.perf_counter()
-        replay.decisions = 0
         with (
             patch.object(openrouter, "post", side_effect=replay.post),
             patch.object(openrouter, "decide", side_effect=replay.decide, create=True),
         ):
             try:
-                enrichment.enrich_bundle(enriched, workers=args.workers)
+                enrichment.enrich_bundle(
+                    enriched, workers=args.workers,
+                    decider_batch_size=args.decider_batch_size,
+                )
             except TypeError:
-                enrichment.enrich_bundle(enriched)
+                try:
+                    enrichment.enrich_bundle(enriched, workers=args.workers)
+                except TypeError:
+                    enrichment.enrich_bundle(enriched)
         stages["enrichment"] = {
             "seconds": round(time.perf_counter() - started, 3),
             **replay.summary(),
-            "decisions": replay.decisions,
+            **replay.decision_summary(),
         }
 
         for mode in ("text", "multimodal"):
@@ -170,6 +200,7 @@ def main() -> int:
     parser.add_argument("--delay", type=float, default=0.05)
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--batch-size", type=int, default=None)
+    parser.add_argument("--decider-batch-size", type=int, default=None)
     args = parser.parse_args()
     if not math.isfinite(args.delay) or args.delay < 0:
         parser.error("--delay must be a non-negative number")

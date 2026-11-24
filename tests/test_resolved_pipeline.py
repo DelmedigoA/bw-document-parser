@@ -39,10 +39,14 @@ class ResolvedPipelineTests(unittest.TestCase):
             self.assertEqual(["continued"], visible[0]["source_ids"])
             write_json(bundle / "document.json", document)
 
-            approved = {"answers": {"enrich": {"type": "noul", "noul": 0.9}}}
-            skipped = {"answers": {"enrich": {"type": "noul", "noul": 0.1}}}
+            probabilities = iter([0.9, 0.1])
+
+            def decide(payload):
+                question_id, = payload["questions"]
+                return {"answers": {question_id: {"type": "noul", "noul": next(probabilities)}}}
+
             with (
-                patch.object(openrouter, "decide", side_effect=[approved, skipped]) as decider,
+                patch.object(openrouter, "decide", side_effect=decide) as decider,
                 patch.object(openrouter, "post", return_value=description("Chart description")) as describe,
             ):
                 self.assertTrue(enrich_bundle(bundle, workers=1))

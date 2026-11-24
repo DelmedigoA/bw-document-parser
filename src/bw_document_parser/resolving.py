@@ -275,6 +275,9 @@ def _carry_annotations(previous: ResolvedDoc, resolved: ResolvedDoc) -> None:
     })
     if "embedding_modes" in previous:
         resolved["embedding_modes"] = previous["embedding_modes"]
+    if "decider_requests" in previous:
+        # Keep the provider's actual per-request charges as an audit ledger.
+        resolved["decider_requests"] = deepcopy(previous["decider_requests"])
 
 
 def main() -> int:
