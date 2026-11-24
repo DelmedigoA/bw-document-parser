@@ -9,7 +9,15 @@ from test_rag_bundle import description, example_bundle, vectors_for
 from bw_document_parser import openrouter
 from bw_document_parser.bundle import fingerprint, read_document, write_json
 from bw_document_parser.chunks import MAX_TOKENS, _token_count
-from bw_document_parser.document import Location, Page, Piece, Text, unpack_piece
+from bw_document_parser.document import (
+    Figure,
+    Location,
+    Page,
+    Piece,
+    Table,
+    Text,
+    unpack_piece,
+)
 from bw_document_parser.embeddings import embed_bundle, search_bundle
 from bw_document_parser.enrichment import enrich_bundle
 from bw_document_parser.inspector import _resolved_page
@@ -17,6 +25,34 @@ from bw_document_parser.resolving import resolve_document
 
 
 class ResolvedPipelineTests(unittest.TestCase):
+    def test_visuals_share_section_heading_and_keep_their_own_titles(self):
+        with TemporaryDirectory() as directory:
+            source = asdict(example_bundle(Path(directory)))
+        blocks = [
+            Piece("heading", "section_header", Text("Situation map and population table", 1)),
+            Piece("map", "picture", Figure()),
+            Piece("caption", "section_header", Text("Population table", 1),
+                  [Location(1, (0.1, 0.5, 0.9, 0.52))]),
+            Piece("table", "table", Table("<table></table>"),
+                  [Location(1, (0.1, 0.53, 0.9, 0.7))]),
+            Piece("next-heading", "section_header", Text("Next section", 1)),
+            Piece("chart", "picture", Figure()),
+        ]
+        source["pages"] = [
+            asdict(Page(1, 100, 100, [block.id for block in blocks])),
+            asdict(Page(2, 100, 100, ["unheaded"])),
+        ]
+        source["pieces"] = [*map(asdict, blocks), asdict(Piece("unheaded", "picture", Figure()))]
+
+        document = resolve_document(source)
+        _, map_piece, table_piece, _, chart_piece = _resolved_page(document, 1)["pieces"]
+        self.assertEqual("Situation map and population table", map_piece["section_heading"])
+        self.assertEqual(map_piece["section_heading"], table_piece["section_heading"])
+        self.assertEqual(["map"], map_piece["source_ids"])
+        self.assertEqual(["caption", "table"], table_piece["source_ids"])
+        self.assertEqual("Next section", chart_piece["section_heading"])
+        self.assertNotIn("section_heading", _resolved_page(document, 2)["pieces"][0])
+
     def test_small_pieces_and_hosted_stages_preserve_structure(self):
         with TemporaryDirectory() as directory:
             bundle = Path(directory)

@@ -317,7 +317,9 @@ function renderResolved(current) {
     ) {
       summary.append(blocks.shift());
     } else {
-      summary.textContent = piece.title || "Untitled piece";
+      summary.textContent = piece.section_heading
+        ? `${piece.title} · ${piece.section_heading}`
+        : piece.title || "Untitled piece";
     }
     const body = document.createElement("div");
     body.className = "resolved-section-body";

@@ -8,7 +8,7 @@ from pathlib import Path
 
 from filelock import FileLock, Timeout
 
-from .bundle import read_json, write_json
+from .bundle import pieces_with_context, read_json, write_json
 from .chunks import _Block, _pack_section
 from .document import (
     ParsedDoc,
@@ -20,7 +20,7 @@ from .document import (
 )
 from .table_links import link_table_context
 
-RESOLVE_STRATEGY = "adjacent-content-v1"
+RESOLVE_STRATEGY = "adjacent-content-v2"
 _SOURCE_PAGE = re.compile(r"p(\d+):")
 
 
@@ -58,6 +58,11 @@ def resolve_document(parsed: ParsedDoc) -> ResolvedDoc:
         raise ValueError("Resolve needs parsed.json or a version 2 document.json")
     source = deepcopy(parsed)
     link_table_context(source)
+    visual_headings = {
+        block["id"]: headings[-1]
+        for block, headings, _ in pieces_with_context(source, carry_across_pages=False)
+        if headings and block["content"]["kind"] in {"figure", "table"}
+    }
     pages = {
         page["number"]: {key: value for key, value in page.items() if key != "piece_ids"}
         for page in source["pages"]
@@ -96,6 +101,8 @@ def resolve_document(parsed: ParsedDoc) -> ResolvedDoc:
         }
         if not title and kind in {"table", "figure"}:
             piece["title"] = kind.capitalize()
+        if heading := visual_headings.get(block_id):
+            piece["section_heading"] = heading
         pages[number]["pieces"].append(piece)
         return piece
 

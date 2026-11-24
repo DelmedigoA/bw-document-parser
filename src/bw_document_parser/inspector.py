@@ -40,6 +40,7 @@ def _resolved_page(document: dict, number: int) -> dict | None:
         if blocks:
             sections.append(pack_piece({
                 "id": piece["id"], "title": piece["title"], "page": piece["page"],
+                **({"section_heading": piece["section_heading"]} if "section_heading" in piece else {}),
                 "blocks": blocks,
                 "embeddings": [
                     {key: value for key, value in entry.items() if key != "vector"}

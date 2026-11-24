@@ -80,9 +80,15 @@ def text_of(piece: dict) -> str:
     return piece["content"].get("text", "").strip()
 
 
-def pieces_with_context(document: dict, *, include_decorative: bool = True) -> Iterator[tuple[dict, tuple[str, ...], dict]]:
-    """Walk page roots and children, carrying section headings across pages."""
+def pieces_with_context(
+    document: dict, *, include_decorative: bool = True, carry_across_pages: bool = True,
+) -> Iterator[tuple[dict, tuple[str, ...], dict]]:
+    """Walk source blocks with their section headings in reading order."""
     pieces = {piece["id"]: piece for piece in document["pieces"]}
+    visual_titles = {
+        ref for piece in pieces.values() if piece["content"]["kind"] in {"figure", "table"}
+        for ref in (*piece["caption_ids"], piece.get("inferred_title_id")) if ref
+    }
     seen = set()
 
     def walk(ids, headings):
@@ -94,7 +100,10 @@ def pieces_with_context(document: dict, *, include_decorative: bool = True) -> I
             if not include_decorative and (piece.get("enrichment") or {}).get("decorative") is True:
                 continue
             label = piece["label"]
-            if label in {"title", "section_header"} and text_of(piece):
+            if (
+                label in {"title", "section_header"} and piece_id not in visual_titles
+                and piece["layer"] in {None, "body"} and text_of(piece)
+            ):
                 level = 0 if label == "title" else piece["content"].get("level") or 1
                 headings[:] = [(rank, text) for rank, text in headings if rank < level]
                 headings.append((level, text_of(piece)))
@@ -104,6 +113,8 @@ def pieces_with_context(document: dict, *, include_decorative: bool = True) -> I
 
     headings = []
     for page in document["pages"]:
+        if not carry_across_pages:
+            headings.clear()
         yield from walk(page["piece_ids"], headings)
 
 
